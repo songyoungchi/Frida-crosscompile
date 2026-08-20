@@ -19,9 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       # Use official Termux package builder image which includes qemu-user-static and binfmt support.
-      # We run with --privileged to allow mounting /proc, /sys, and enabling binfmt_misc.
+      # We run with --privileged and --user root to allow mounting and package installation.
       image: ghcr.io/termux/package-builder:latest
-      options: --privileged
+      options: --privileged --user root
 
     steps:
       - name: Checkout repository (optional)
@@ -29,10 +29,16 @@ jobs:
 
       - name: Install host dependencies
         run: |
-          # Ensure curl and unzip are available on the host (container)
-          apt-get update
-          apt-get install -y curl unzip
-          # Enable ARM binary execution through qemu
+          # Ensure curl and unzip are available (they may already be present, but we install if missing)
+          if ! command -v curl >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y curl
+          fi
+          if ! command -v unzip >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y unzip
+          fi
+          # Enable ARM binary execution through qemu (if not already enabled)
           update-binfmts --enable qemu-arm || true
 
       - name: Set up Termux rootfs for ARMv7 and build package
