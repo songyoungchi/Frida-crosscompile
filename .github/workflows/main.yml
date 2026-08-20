@@ -26,14 +26,9 @@ jobs:
         uses: actions/checkout@v4
 
       # APPROACH EXPLANATION:
-      # While the official `termux/package-builder` image excels at cross-compiling standard C/C++ packages,
-      # building Python C-extensions (like frida-python) via cross-compilation is highly prone to host/target 
-      # Python environment mismatches. 
-      # To exactly replicate the provided on-device build script, we instead set up `qemu-user-static` 
-      # with `binfmt_misc` integration. This allows us to transparently execute a native 32-bit ARMv7 
-      # Debian container (`debian:bookworm`). Inside this container, we manually recreate the Termux rootfs 
-      # structure (`/data/data/com.termux/...`), natively compile the extensions against the ARM devkit, 
-      # and package the exact output into a Termux-compatible .deb archive.
+      # We use `qemu-user-static` to transparently execute a native 32-bit ARMv7
+      # Debian container (`debian:bookworm`). Inside this container, we natively 
+      # compile the extensions against the ARM devkit to avoid cross-compilation bugs.
       - name: Set up QEMU for ARM emulation
         uses: docker/setup-qemu-action@v3
         with:
@@ -94,6 +89,17 @@ jobs:
           export FRIDA_VERSION="$FRIDA_VERSION"
           export FRIDA_CORE_DEVKIT="/devkit"
           export PIP_BREAK_SYSTEM_PACKAGES=1 # Required for Debian Bookworm Python 3.11+
+
+          # ====================================================================
+          # CRITICAL COMPILER FIX: Hard-float (Debian) vs SoftFP (Android/Frida)
+          # ====================================================================
+          # Debian Bookworm ARMv7 uses hardware floating-point arguments (gnueabihf),
+          # but the Frida Android DevKit uses software floating-point (softfp).
+          # We must force Debian's GCC to use softfp and instruct the linker
+          # to ignore the architecture mismatch warning during the merge.
+          export CFLAGS="-mfloat-abi=softfp -O2"
+          export LDFLAGS="-Wl,--no-warn-mismatch"
+          # ====================================================================
 
           # Build and install frida-python
           cd frida-python-android
