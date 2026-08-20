@@ -1,0 +1,161 @@
+# .github/workflows/build-frida-termux-deb.yml
+name: Build Frida Termux DEB (ARMv7)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      frida_version:
+        description: 'Frida version (e.g., 17.0.7). Leave blank for latest.'
+        required: false
+        type: string
+        default: ''
+      frida_tools_version:
+        description: 'Frida Tools version (e.g., 14.0.2). Leave blank for automatic.'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  build-frida-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # APPROACH EXPLANATION:
+      # While the official `termux/package-builder` image excels at cross-compiling standard C/C++ packages,
+      # building Python C-extensions (like frida-python) via cross-compilation is highly prone to host/target 
+      # Python environment mismatches. 
+      # To exactly replicate the provided on-device build script, we instead set up `qemu-user-static` 
+      # with `binfmt_misc` integration. This allows us to transparently execute a native 32-bit ARMv7 
+      # Debian container (`debian:bookworm`). Inside this container, we manually recreate the Termux rootfs 
+      # structure (`/data/data/com.termux/...`), natively compile the extensions against the ARM devkit, 
+      # and package the exact output into a Termux-compatible .deb archive.
+      - name: Set up QEMU for ARM emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Generate Build Script
+        run: |
+          cat << 'EOF' > build.sh
+          #!/bin/bash
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+
+          # 1. Install required build dependencies inside the container
+          apt-get update
+          apt-get install -y python3 python3-pip python3-dev python3-setuptools git curl tar xz-utils build-essential pkg-config dpkg-dev jq gawk
+
+          # Map architecture strictly to arm for ARMv7
+          DARCH="arm"
+
+          # 2. Determine FRIDA_VERSION
+          FRIDA_VERSION="$1"
+          if [ -z "$FRIDA_VERSION" ]; then
+            echo "No Frida version provided. Fetching latest from GitHub API..."
+            FRIDA_VERSION=$(curl -s "https://api.github.com/repos/frida/frida/releases/latest" | jq -r .tag_name)
+          fi
+          echo "Using Frida Version: $FRIDA_VERSION"
+
+          # 3. Download and extract frida-core-devkit
+          DEVKIT_URL="https://github.com/frida/frida/releases/download/$FRIDA_VERSION/frida-core-devkit-$FRIDA_VERSION-android-$DARCH.tar.xz"
+          mkdir -p /devkit
+          echo "Downloading DevKit from: $DEVKIT_URL"
+          curl -L -o /devkit/devkit.tar.xz "$DEVKIT_URL"
+          tar -xvf /devkit/devkit.tar.xz -C /devkit
+
+          # Helper function for version comparison
+          version() { echo "$1" | awk -F. '{ printf("%d%03d%03d", $1,$2,$3); }'; }
+
+          # 4. Clone correct frida-python branch based on version
+          if [ "$(version "$FRIDA_VERSION")" -le "$(version "17.0.7")" ]; then
+            if [ "$(version "$FRIDA_VERSION")" -lt "$(version "17.0.0")" ]; then
+              TOOLS_VERSION="<=13.7.1"
+            else
+              TOOLS_VERSION="<=14.0.2"
+            fi
+            echo "Cloning frida-python (branch 17.0.7)..."
+            git clone https://github.com/AbhiTheModder/frida-python frida-python-android -b 17.0.7
+          else
+            TOOLS_VERSION=">14.0.2"
+            echo "Cloning frida-python (default branch)..."
+            git clone https://github.com/AbhiTheModder/frida-python frida-python-android
+          fi
+
+          # 5. Build and install packages into a Termux staging directory
+          PREFIX="/data/data/com.termux/files/usr"
+          STAGING="/work/staging"
+          mkdir -p "$STAGING$PREFIX"
+
+          export FRIDA_VERSION="$FRIDA_VERSION"
+          export FRIDA_CORE_DEVKIT="/devkit"
+          export PIP_BREAK_SYSTEM_PACKAGES=1 # Required for Debian Bookworm Python 3.11+
+
+          # Build and install frida-python
+          cd frida-python-android
+          echo "Building frida-python..."
+          pip3 install --prefix="$PREFIX" --root="$STAGING" --force-reinstall .
+          cd ..
+
+          # Install frida-tools
+          USER_TOOLS_VERSION="$2"
+          if [ -n "$USER_TOOLS_VERSION" ]; then
+            echo "Installing specific frida-tools==$USER_TOOLS_VERSION..."
+            pip3 install --prefix="$PREFIX" --root="$STAGING" "frida-tools==$USER_TOOLS_VERSION"
+          else
+            echo "Installing frida-tools$TOOLS_VERSION..."
+            pip3 install --prefix="$PREFIX" --root="$STAGING" "frida-tools$TOOLS_VERSION"
+          fi
+
+          # Standardize Python installation paths (Debian uses dist-packages, Termux expects site-packages)
+          if ls -d "$STAGING$PREFIX"/lib/python3.*/dist-packages >/dev/null 2>&1; then
+            for py_dir in "$STAGING$PREFIX"/lib/python3.*; do
+              if [ -d "$py_dir/dist-packages" ]; then
+                mv "$py_dir/dist-packages" "$py_dir/site-packages"
+              fi
+            done
+          fi
+
+          # 6. Adjust Python shebangs for Termux environment
+          echo "Adjusting shebangs..."
+          for script in "$STAGING$PREFIX/bin/"*; do
+            if [ -f "$script" ]; then
+              sed -i '1c#!/data/data/com.termux/files/usr/bin/python' "$script"
+            fi
+          done
+
+          # 7. Create DEBIAN/control file
+          echo "Creating DEBIAN/control..."
+          mkdir -p "$STAGING/DEBIAN"
+          echo "Package: frida-tools-termux" > "$STAGING/DEBIAN/control"
+          echo "Version: $FRIDA_VERSION" >> "$STAGING/DEBIAN/control"
+          echo "Architecture: arm" >> "$STAGING/DEBIAN/control"
+          echo "Maintainer: GitHub Actions" >> "$STAGING/DEBIAN/control"
+          echo "Description: Frida CLI tools for Termux (Android 8.1, armv7)" >> "$STAGING/DEBIAN/control"
+          echo "Depends: python, python-pip" >> "$STAGING/DEBIAN/control"
+
+          # 8. Build the .deb package
+          echo "Building .deb package..."
+          dpkg-deb --build "$STAGING" "/work/frida-tools-termux_${FRIDA_VERSION}_arm.deb"
+          EOF
+
+      - name: Build DEB in ARMv7 Container
+        run: |
+          chmod +x build.sh
+          # Run the script inside an ARMv7 Debian container using QEMU
+          docker run --rm --platform linux/arm/v7 \
+            -v ${{ github.workspace }}:/work \
+            -w /work \
+            debian:bookworm \
+            /work/build.sh "${{ inputs.frida_version }}" "${{ inputs.frida_tools_version }}"
+
+      - name: Upload DEB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frida-tools-termux-arm
+          path: ./*.deb
+          if-no-files-found: error
