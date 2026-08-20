@@ -18,7 +18,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      # Use official Termux package builder image (includes qemu-user-static and binfmt support)
+      # Official Termux package builder image includes qemu-user-static and binfmt support.
+      # Run as root with privileged mode to allow proot and binfmt.
       image: ghcr.io/termux/package-builder:latest
       options: --privileged --user root
 
@@ -35,7 +36,7 @@ jobs:
           # Enable ARM binary execution via binfmt (if not already)
           update-binfmts --enable qemu-arm || true
 
-      - name: Set up Termux rootfs and build package
+      - name: Set up Termux rootfs for ARMv7 and build package
         env:
           FRIDA_VERSION_INPUT: ${{ github.event.inputs.frida_version }}
           FRIDA_TOOLS_VERSION_INPUT: ${{ github.event.inputs.frida_tools_version }}
@@ -45,22 +46,30 @@ jobs:
           # ----- 1. Prepare Termux rootfs for arm (ARMv7) -----
           ARCH=arm
           ROOTFS_DIR="$PWD/termux-rootfs"
-          mkdir -p "$ROOTFS_DIR"
+          # Create the full Termux prefix path inside the rootfs.
+          # The bootstrap zip contains the contents of the prefix (bin, lib, etc.)
+          # and is intended to be extracted into /data/data/com.termux/files/usr.
+          PREFIX_DIR="$ROOTFS_DIR/data/data/com.termux/files/usr"
+          mkdir -p "$PREFIX_DIR"
 
           # Download latest Termux bootstrap for arm
           BOOTSTRAP_URL="https://github.com/termux/termux-packages/releases/latest/download/bootstrap-${ARCH}.zip"
           echo "Downloading Termux bootstrap from $BOOTSTRAP_URL"
           curl -L -o bootstrap.zip "$BOOTSTRAP_URL"
-          unzip -q bootstrap.zip -d "$ROOTFS_DIR"
+          # Extract directly into the prefix directory
+          unzip -q bootstrap.zip -d "$PREFIX_DIR"
           rm bootstrap.zip
 
           # Set up basic files for proot (resolv.conf, etc.)
           mkdir -p "$ROOTFS_DIR/etc"
           cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf" 2>/dev/null || true
+          # Create home directory as per Termux layout
+          mkdir -p "$ROOTFS_DIR/data/data/com.termux/files/home"
 
           # ----- 2. Build inside ARM Termux environment using proot -----
           # proot provides a virtual root without requiring a full Linux rootfs.
-          # The Termux bootstrap only contains the prefix under data/data/com.termux/files/usr.
+          # We bind /dev, /proc, /sys to mimic a real Android environment.
+          # The working directory is set to the Termux home.
           proot -S "$ROOTFS_DIR" \
                 -b /dev -b /proc -b /sys \
                 -w /data/data/com.termux/files/home \
@@ -74,6 +83,7 @@ jobs:
           # Basic setup inside Termux
           export HOME=/data/data/com.termux/files/home
           export PATH="$HOME/bin:/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets:$PATH"
+          # Create home if not exists (should be already)
           mkdir -p "$HOME"
 
           pkg update -y
@@ -87,6 +97,7 @@ jobs:
           else
               FRIDA_VERSION="$FRIDA_VERSION_INPUT"
               echo "Using specified Frida version: $FRIDA_VERSION"
+              # Verify the version exists
               RELEASE=$(curl --silent "https://api.github.com/repos/frida/frida/releases/tags/$FRIDA_VERSION")
               if echo "$RELEASE" | grep -q '"message": "Not Found"'; then
                   echo "Error: $FRIDA_VERSION is not a released Frida version."
@@ -103,6 +114,7 @@ jobs:
           rm frida-core-devkit-android-arm.tar.xz
 
           # ----- 5. Clone frida-python with appropriate branch -----
+          # Version comparison function
           version() { echo "$1" | awk -F. '{ printf("%d%03d%03d", $1,$2,$3); }' }
 
           if [ "$(version "$FRIDA_VERSION")" -le "$(version "17.0.7")" ]; then
@@ -136,6 +148,7 @@ jobs:
 
           # ----- 8. Package into .deb -----
           PREFIX=/data/data/com.termux/files/usr
+          # Find Python site-packages path
           PYTHON_SITE=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
           STAGING_DIR="$HOME/deb-root"
           mkdir -p "$STAGING_DIR$PREFIX"
@@ -158,6 +171,7 @@ jobs:
 
           # Create DEBIAN control
           mkdir -p "$STAGING_DIR/DEBIAN"
+          # Sanitize version for Debian package
           VERSION=$(echo "$FRIDA_VERSION" | sed 's/^v//')
           cat > "$STAGING_DIR/DEBIAN/control" <<EOC
           Package: frida-tools-termux
