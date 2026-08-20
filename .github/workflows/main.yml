@@ -18,8 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      # Use official Termux package builder image which includes qemu-user-static and binfmt support.
-      # Run as root and with privileged mode to allow mounting and package operations.
+      # Use official Termux package builder image (includes qemu-user-static and binfmt support)
       image: ghcr.io/termux/package-builder:latest
       options: --privileged --user root
 
@@ -27,12 +26,16 @@ jobs:
       - name: Checkout repository (optional)
         uses: actions/checkout@v4
 
-      - name: Enable ARM binary execution
+      - name: Install host dependencies (proot, curl, unzip)
         run: |
-          # Enable qemu-arm binfmt if not already enabled (typically already enabled in the image)
+          # Create apt partial directory if missing (fixes apt-get update error)
+          mkdir -p /var/lib/apt/lists/partial
+          apt-get update
+          apt-get install -y proot curl unzip
+          # Enable ARM binary execution via binfmt (if not already)
           update-binfmts --enable qemu-arm || true
 
-      - name: Set up Termux rootfs for ARMv7 and build package
+      - name: Set up Termux rootfs and build package
         env:
           FRIDA_VERSION_INPUT: ${{ github.event.inputs.frida_version }}
           FRIDA_TOOLS_VERSION_INPUT: ${{ github.event.inputs.frida_tools_version }}
@@ -51,17 +54,17 @@ jobs:
           unzip -q bootstrap.zip -d "$ROOTFS_DIR"
           rm bootstrap.zip
 
-          # Set up necessary files and mounts for chroot
-          cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf" || true
-          mkdir -p "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys" \
-                   "$ROOTFS_DIR/data/data/com.termux/files/home"
-          mount --bind /dev "$ROOTFS_DIR/dev"
-          mount -t proc none "$ROOTFS_DIR/proc"
-          mount -t sysfs none "$ROOTFS_DIR/sys"
+          # Set up basic files for proot (resolv.conf, etc.)
+          mkdir -p "$ROOTFS_DIR/etc"
+          cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf" 2>/dev/null || true
 
-          # ----- 2. Build inside the ARM Termux environment -----
-          # Termux uses a non-standard path for its shell; use the full path inside chroot.
-          chroot "$ROOTFS_DIR" /data/data/com.termux/files/usr/bin/bash -s <<'EOF'
+          # ----- 2. Build inside ARM Termux environment using proot -----
+          # proot provides a virtual root without requiring a full Linux rootfs.
+          # The Termux bootstrap only contains the prefix under data/data/com.termux/files/usr.
+          proot -S "$ROOTFS_DIR" \
+                -b /dev -b /proc -b /sys \
+                -w /data/data/com.termux/files/home \
+                /data/data/com.termux/files/usr/bin/bash -s <<'EOF'
           set -e
 
           # Environment variables passed from workflow
