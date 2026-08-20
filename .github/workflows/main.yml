@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       # Use official Termux package builder image which includes qemu-user-static and binfmt support.
-      # We run with --privileged and --user root to allow mounting and package installation.
+      # Run as root and with privileged mode to allow mounting and package operations.
       image: ghcr.io/termux/package-builder:latest
       options: --privileged --user root
 
@@ -27,18 +27,9 @@ jobs:
       - name: Checkout repository (optional)
         uses: actions/checkout@v4
 
-      - name: Install host dependencies
+      - name: Enable ARM binary execution
         run: |
-          # Ensure curl and unzip are available (they may already be present, but we install if missing)
-          if ! command -v curl >/dev/null 2>&1; then
-            apt-get update
-            apt-get install -y curl
-          fi
-          if ! command -v unzip >/dev/null 2>&1; then
-            apt-get update
-            apt-get install -y unzip
-          fi
-          # Enable ARM binary execution through qemu (if not already enabled)
+          # Enable qemu-arm binfmt if not already enabled (typically already enabled in the image)
           update-binfmts --enable qemu-arm || true
 
       - name: Set up Termux rootfs for ARMv7 and build package
@@ -53,7 +44,7 @@ jobs:
           ROOTFS_DIR="$PWD/termux-rootfs"
           mkdir -p "$ROOTFS_DIR"
 
-          # Download latest Termux bootstrap for arm (compatible with Android 7+, including 8.1)
+          # Download latest Termux bootstrap for arm
           BOOTSTRAP_URL="https://github.com/termux/termux-packages/releases/latest/download/bootstrap-${ARCH}.zip"
           echo "Downloading Termux bootstrap from $BOOTSTRAP_URL"
           curl -L -o bootstrap.zip "$BOOTSTRAP_URL"
@@ -61,23 +52,27 @@ jobs:
           rm bootstrap.zip
 
           # Set up necessary files and mounts for chroot
-          cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
-          mkdir -p "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
+          cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf" || true
+          mkdir -p "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys" \
+                   "$ROOTFS_DIR/data/data/com.termux/files/home"
           mount --bind /dev "$ROOTFS_DIR/dev"
           mount -t proc none "$ROOTFS_DIR/proc"
           mount -t sysfs none "$ROOTFS_DIR/sys"
 
           # ----- 2. Build inside the ARM Termux environment -----
-          chroot "$ROOTFS_DIR" /bin/bash -s <<'EOF'
+          # Termux uses a non-standard path for its shell; use the full path inside chroot.
+          chroot "$ROOTFS_DIR" /data/data/com.termux/files/usr/bin/bash -s <<'EOF'
           set -e
 
-          # Environment variables passed from workflow (adjust if needed)
+          # Environment variables passed from workflow
           FRIDA_VERSION_INPUT="${FRIDA_VERSION_INPUT:-latest}"
           FRIDA_TOOLS_VERSION_INPUT="${FRIDA_TOOLS_VERSION_INPUT:-}"
 
           # Basic setup inside Termux
           export HOME=/data/data/com.termux/files/home
           export PATH="$HOME/bin:/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets:$PATH"
+          mkdir -p "$HOME"
+
           pkg update -y
           pkg upgrade -y
           pkg install -y python python-pip git curl tar xz-utils build-essential pkg-config python-setuptools
@@ -89,7 +84,6 @@ jobs:
           else
               FRIDA_VERSION="$FRIDA_VERSION_INPUT"
               echo "Using specified Frida version: $FRIDA_VERSION"
-              # Verify the version exists (optional)
               RELEASE=$(curl --silent "https://api.github.com/repos/frida/frida/releases/tags/$FRIDA_VERSION")
               if echo "$RELEASE" | grep -q '"message": "Not Found"'; then
                   echo "Error: $FRIDA_VERSION is not a released Frida version."
@@ -106,7 +100,6 @@ jobs:
           rm frida-core-devkit-android-arm.tar.xz
 
           # ----- 5. Clone frida-python with appropriate branch -----
-          # Version comparison function
           version() { echo "$1" | awk -F. '{ printf("%d%03d%03d", $1,$2,$3); }' }
 
           if [ "$(version "$FRIDA_VERSION")" -le "$(version "17.0.7")" ]; then
@@ -140,7 +133,6 @@ jobs:
 
           # ----- 8. Package into .deb -----
           PREFIX=/data/data/com.termux/files/usr
-          # Find Python site-packages path
           PYTHON_SITE=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
           STAGING_DIR="$HOME/deb-root"
           mkdir -p "$STAGING_DIR$PREFIX"
@@ -163,7 +155,6 @@ jobs:
 
           # Create DEBIAN control
           mkdir -p "$STAGING_DIR/DEBIAN"
-          # Sanitize version for Debian package
           VERSION=$(echo "$FRIDA_VERSION" | sed 's/^v//')
           cat > "$STAGING_DIR/DEBIAN/control" <<EOC
           Package: frida-tools-termux
@@ -179,7 +170,6 @@ jobs:
           cat > "$STAGING_DIR/DEBIAN/postinst" <<'EOP'
           #!/bin/sh
           set -e
-          # Ensure proper permissions for binaries (already set)
           exit 0
           EOP
           chmod +x "$STAGING_DIR/DEBIAN/postinst"
@@ -192,7 +182,7 @@ jobs:
 
           # ----- 3. Copy the .deb from rootfs to host for artifact upload -----
           mkdir -p "$GITHUB_WORKSPACE/output"
-          cp "$ROOTFS_DIR/root/"frida-tools-termux_*.deb "$GITHUB_WORKSPACE/output/"
+          cp "$ROOTFS_DIR/data/data/com.termux/files/home/"frida-tools-termux_*.deb "$GITHUB_WORKSPACE/output/"
           echo "Deb package copied to $GITHUB_WORKSPACE/output/"
           ls -l "$GITHUB_WORKSPACE/output/"
 
