@@ -1,9 +1,3 @@
-# The previous approach failed because standard Ubuntu rootfs lacks the Android dynamic linker 
-# (/system/bin/linker) which Termux ARM binaries are hardcoded to use via Bionic libc.
-# To resolve this, this workflow uses the official `termux/termux-docker:arm` container image.
-# This image provides a complete simulated Android environment, including the required 
-# Bionic libc structures and the /system directory, allowing QEMU to execute Termux binaries flawlessly.
-
 name: Build Frida-Tools Termux DEB (ARMv7)
 
 on:
@@ -49,7 +43,8 @@ jobs:
           
           echo "Updating packages..."
           pkg update -y
-          pkg install -y python git curl tar build-essential pkg-config dpkg
+          # Added 'which' and 'debianutils' to satisfy the frida-python setup/make scripts
+          pkg install -y python git curl tar build-essential pkg-config dpkg which debianutils
           
           # Determine Target Frida Version
           INPUT_FRIDA="${FRIDA_VERSION_INPUT}"
@@ -93,8 +88,6 @@ jobs:
           fi
           
           cd $HOME/frida-python-android
-          export FRIDA_VERSION=$FRIDA_VERSION
-          export FRIDA_CORE_DEVKIT=$HOME/devkit
           
           pip install --upgrade pip setuptools wheel
           
@@ -102,7 +95,10 @@ jobs:
           
           # Build binary wheel for frida-python natively against Bionic libc via QEMU
           echo "Building frida-python wheel..."
-          pip wheel . -w $HOME/wheels
+          # We use --no-build-isolation to ensure the build happens exactly in-tree, 
+          # preventing PEP 517 from copying the source to a temp directory and losing the Git context,
+          # which triggers fallback build paths (like downloading toolchains) in setup.py.
+          FRIDA_VERSION="$FRIDA_VERSION" FRIDA_CORE_DEVKIT="$HOME/devkit" pip wheel . --no-build-isolation -w $HOME/wheels
           
           # Build wheel for frida-tools (pulling in all native python dependencies)
           echo "Building frida-tools wheel..."
@@ -149,8 +145,6 @@ jobs:
           chmod +x build.sh
 
           # Run the build script using the official Termux Docker ARM image.
-          # We use --privileged because QEMU running inside a container frequently encounters 
-          # permission blocks on specific syscalls (like memory allocations mapped for ARM emulation).
           docker run --rm --privileged \
             -e FRIDA_VERSION_INPUT="${{ github.event.inputs.frida_version }}" \
             -e FRIDA_TOOLS_INPUT="${{ github.event.inputs.frida_tools_version }}" \
