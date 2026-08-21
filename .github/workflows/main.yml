@@ -43,7 +43,6 @@ jobs:
           
           echo "Updating packages..."
           pkg update -y
-          # Added 'which' and 'debianutils' to satisfy the frida-python setup/make scripts
           pkg install -y python git curl tar build-essential pkg-config dpkg which debianutils
           
           # Determine Target Frida Version
@@ -93,12 +92,11 @@ jobs:
           
           mkdir -p $HOME/wheels
           
-          # Build binary wheel for frida-python natively against Bionic libc via QEMU
+          # Build binary wheel for frida-python natively against Bionic libc via QEMU.
+          # Explicitly pass arguments to prevent frida's setup script from attempting 
+          # to download external prebuilt build dependencies over the network which fail.
           echo "Building frida-python wheel..."
-          # We use --no-build-isolation to ensure the build happens exactly in-tree, 
-          # preventing PEP 517 from copying the source to a temp directory and losing the Git context,
-          # which triggers fallback build paths (like downloading toolchains) in setup.py.
-          FRIDA_VERSION="$FRIDA_VERSION" FRIDA_CORE_DEVKIT="$HOME/devkit" pip wheel . --no-build-isolation -w $HOME/wheels
+          FRIDA_VERSION="$FRIDA_VERSION" FRIDA_CORE_DEVKIT="$HOME/devkit" pip wheel . --no-build-isolation --config-settings=build-ext--without-prebuilds=toolchain -w $HOME/wheels
           
           # Build wheel for frida-tools (pulling in all native python dependencies)
           echo "Building frida-tools wheel..."
