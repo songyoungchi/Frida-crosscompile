@@ -8,7 +8,7 @@ on:
         required: false
         default: 'latest'
       frida_tools_version:
-        description: 'frida-tools version to install (optional, leave empty for automatic based on Frida version)'
+        description: 'frida-tools version to install (optional, leave empty for automatic)'
         required: false
         default: ''
   push:
@@ -18,7 +18,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      # Official Termux package builder image (includes qemu-user-static and binfmt support)
+      # Official Termux package builder image includes qemu-user-static and binfmt support.
+      # Running privileged as root allows mount/chroot operations.
       image: ghcr.io/termux/package-builder:latest
       options: --privileged --user root
 
@@ -26,26 +27,76 @@ jobs:
       - name: Checkout repository (optional)
         uses: actions/checkout@v4
 
-      - name: Install host dependencies (proot, curl, unzip)
+      - name: Install host dependencies
         run: |
-          # Create apt partial directory if missing (fixes apt-get update error in some containers)
+          # Some containers miss /var/lib/apt/lists/partial; create it to avoid apt error
           mkdir -p /var/lib/apt/lists/partial
           apt-get update
-          apt-get install -y proot curl unzip
-          # Enable ARM binary execution via binfmt (if not already)
+          apt-get install -y curl unzip qemu-user-static binfmt-support dpkg-dev
+          # Enable ARM binary execution via binfmt (qemu-arm)
           update-binfmts --enable qemu-arm || true
 
-      - name: Set up Termux rootfs for ARMv7 and build package
+      - name: Determine Frida version and tools constraint
+        id: version
+        run: |
+          set -e
+
+          # Determine FRIDA_VERSION
+          if [ "${{ github.event.inputs.frida_version }}" = "latest" ] || [ -z "${{ github.event.inputs.frida_version }}" ]; then
+            FRIDA_VERSION=$(curl --silent "https://api.github.com/repos/frida/frida/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+            echo "Latest Frida version: $FRIDA_VERSION"
+          else
+            FRIDA_VERSION="${{ github.event.inputs.frida_version }}"
+            # Verify the version exists
+            RELEASE=$(curl --silent "https://api.github.com/repos/frida/frida/releases/tags/$FRIDA_VERSION")
+            if echo "$RELEASE" | grep -q '"message": "Not Found"'; then
+              echo "Error: $FRIDA_VERSION is not a released Frida version."
+              exit 1
+            fi
+            echo "Using specified Frida version: $FRIDA_VERSION"
+          fi
+
+          # Sanitize version for Debian package (remove leading 'v' if present)
+          VERSION=$(echo "$FRIDA_VERSION" | sed 's/^v//')
+          echo "Debian package version: $VERSION"
+
+          # Determine frida-tools version constraint based on FRIDA_VERSION
+          version() { echo "$1" | awk -F. '{ printf("%d%03d%03d", $1,$2,$3); }' }
+          if [ "$(version "$FRIDA_VERSION")" -le "$(version "17.0.7")" ]; then
+            if [ "$(version "$FRIDA_VERSION")" -lt "$(version "17.0.0")" ]; then
+              TOOLS_VERSION="<=13.7.1"
+            else
+              TOOLS_VERSION="<=14.0.2"
+            fi
+          else
+            TOOLS_VERSION=">14.0.2"
+          fi
+
+          # If explicit frida-tools version provided, override
+          if [ -n "${{ github.event.inputs.frida_tools_version }}" ] && [ "${{ github.event.inputs.frida_tools_version }}" != "automatic" ]; then
+            FTOOLS_VERSION="${{ github.event.inputs.frida_tools_version }}"
+          else
+            FTOOLS_VERSION="$TOOLS_VERSION"
+          fi
+
+          # Export for later steps
+          echo "FRIDA_VERSION=$FRIDA_VERSION" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "TOOLS_VERSION=$TOOLS_VERSION" >> $GITHUB_ENV
+          echo "FTOOLS_VERSION=$FTOOLS_VERSION" >> $GITHUB_ENV
+          echo "FRIDA_TOOLS_VERSION_INPUT=${{ github.event.inputs.frida_tools_version }}" >> $GITHUB_ENV
+
+      - name: Set up Termux rootfs for ARMv7 and build inside
         env:
-          FRIDA_VERSION_INPUT: ${{ github.event.inputs.frida_version }}
-          FRIDA_TOOLS_VERSION_INPUT: ${{ github.event.inputs.frida_tools_version }}
+          FRIDA_VERSION: ${{ env.FRIDA_VERSION }}
+          TOOLS_VERSION: ${{ env.TOOLS_VERSION }}
+          FTOOLS_VERSION: ${{ env.FTOOLS_VERSION }}
         run: |
           set -e
 
           # ----- 1. Prepare Termux rootfs for arm (ARMv7) -----
           ARCH=arm
           ROOTFS_DIR="$PWD/termux-rootfs"
-          # Termux prefix path inside the rootfs
           PREFIX_DIR="$ROOTFS_DIR/data/data/com.termux/files/usr"
           mkdir -p "$PREFIX_DIR"
 
@@ -53,31 +104,36 @@ jobs:
           BOOTSTRAP_URL="https://github.com/termux/termux-packages/releases/latest/download/bootstrap-${ARCH}.zip"
           echo "Downloading Termux bootstrap from $BOOTSTRAP_URL"
           curl -L -o bootstrap.zip "$BOOTSTRAP_URL"
-          # Extract bootstrap contents directly into the prefix (standard Termux layout)
           unzip -q bootstrap.zip -d "$PREFIX_DIR"
           rm bootstrap.zip
 
-          # Set up basic files for proot
+          # Set up basic files for chroot
           mkdir -p "$ROOTFS_DIR/etc" "$ROOTFS_DIR/data/data/com.termux/files/home"
           cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf" 2>/dev/null || true
 
-          # Locate qemu-arm-static (required to run ARM binaries in proot)
+          # Locate qemu-arm-static and copy into rootfs so that ARM binaries can run
           QEMU_BIN=$(which qemu-arm-static)
           echo "Using qemu-arm-static: $QEMU_BIN"
+          mkdir -p "$ROOTFS_DIR/usr/bin"
+          cp "$QEMU_BIN" "$ROOTFS_DIR/usr/bin/qemu-arm-static"
 
-          # ----- 2. Build inside ARM Termux environment using proot -----
-          # proot provides a virtual root and uses qemu to execute ARM binaries.
-          # Bind /dev, /proc, /sys to mimic a real environment.
-          proot -S "$ROOTFS_DIR" \
-                -b /dev -b /proc -b /sys \
-                -q "$QEMU_BIN" \
-                -w /data/data/com.termux/files/home \
-                /data/data/com.termux/files/usr/bin/bash -s <<'EOF'
+          # Bind mount /dev, /proc, /sys for a functional environment
+          mkdir -p "$ROOTFS_DIR/dev" "$ROOTFS_DIR/proc" "$ROOTFS_DIR/sys"
+          mount --bind /dev "$ROOTFS_DIR/dev"
+          mount -t proc none "$ROOTFS_DIR/proc"
+          mount -t sysfs none "$ROOTFS_DIR/sys"
+
+          # ----- 2. Build inside ARM Termux environment using chroot -----
+          # Use env to pass variables into the chroot; the heredoc is quoted so no host expansion.
+          chroot "$ROOTFS_DIR" /data/data/com.termux/files/usr/bin/env \
+            HOME=/data/data/com.termux/files/home \
+            PATH=/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets \
+            FRIDA_VERSION="$FRIDA_VERSION" \
+            TOOLS_VERSION="$TOOLS_VERSION" \
+            FTOOLS_VERSION="$FTOOLS_VERSION" \
+            FRIDA_TOOLS_VERSION_INPUT="$FRIDA_TOOLS_VERSION_INPUT" \
+            /data/data/com.termux/files/usr/bin/bash -s <<'EOF'
           set -e
-
-          # Environment variables passed from workflow
-          FRIDA_VERSION_INPUT="${FRIDA_VERSION_INPUT:-latest}"
-          FRIDA_TOOLS_VERSION_INPUT="${FRIDA_TOOLS_VERSION_INPUT:-}"
 
           # Basic setup inside Termux
           export HOME=/data/data/com.termux/files/home
@@ -88,22 +144,7 @@ jobs:
           pkg upgrade -y
           pkg install -y python python-pip git curl tar xz-utils build-essential pkg-config python-setuptools
 
-          # ----- 3. Determine FRIDA_VERSION -----
-          if [ -z "$FRIDA_VERSION_INPUT" ] || [ "$FRIDA_VERSION_INPUT" = "latest" ]; then
-              FRIDA_VERSION=$(curl --silent "https://api.github.com/repos/frida/frida/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-              echo "Latest Frida version: $FRIDA_VERSION"
-          else
-              FRIDA_VERSION="$FRIDA_VERSION_INPUT"
-              echo "Using specified Frida version: $FRIDA_VERSION"
-              # Verify the version exists
-              RELEASE=$(curl --silent "https://api.github.com/repos/frida/frida/releases/tags/$FRIDA_VERSION")
-              if echo "$RELEASE" | grep -q '"message": "Not Found"'; then
-                  echo "Error: $FRIDA_VERSION is not a released Frida version."
-                  exit 1
-              fi
-          fi
-
-          # ----- 4. Download frida-core-devkit for android-arm -----
+          # ----- 3. Download frida-core-devkit for android-arm -----
           DEVKIT_URL="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-core-devkit-${FRIDA_VERSION}-android-arm.tar.xz"
           echo "Downloading devkit from $DEVKIT_URL"
           curl -L -o frida-core-devkit-android-arm.tar.xz "$DEVKIT_URL"
@@ -111,42 +152,32 @@ jobs:
           tar -xvf frida-core-devkit-android-arm.tar.xz -C "$HOME/devkit"
           rm frida-core-devkit-android-arm.tar.xz
 
-          # ----- 5. Clone frida-python with appropriate branch -----
-          # Version comparison function
-          version() { echo "$1" | awk -F. '{ printf("%d%03d%03d", $1,$2,$3); }' }
-
-          if [ "$(version "$FRIDA_VERSION")" -le "$(version "17.0.7")" ]; then
-              if [ "$(version "$FRIDA_VERSION")" -lt "$(version "17.0.0")" ]; then
-                  TOOLS_VERSION="<=13.7.1"
-              else
-                  TOOLS_VERSION="<=14.0.2"
-              fi
-              git clone https://github.com/AbhiTheModder/frida-python frida-python-android -b 17.0.7
+          # ----- 4. Clone frida-python with appropriate branch -----
+          if [ "$(echo "$FRIDA_VERSION" | awk -F. '{ printf("%d%03d%03d", $1,$2,$3); }')" -le "$(echo "17.0.7" | awk -F. '{ printf("%d%03d%03d", $1,$2,$3); }')" ]; then
+            git clone https://github.com/AbhiTheModder/frida-python frida-python-android -b 17.0.7
           else
-              TOOLS_VERSION=">14.0.2"
-              git clone https://github.com/AbhiTheModder/frida-python frida-python-android
+            git clone https://github.com/AbhiTheModder/frida-python frida-python-android
           fi
 
-          # ----- 6. Build and install frida-python -----
+          # ----- 5. Build and install frida-python -----
           cd frida-python-android
           FRIDA_VERSION="$FRIDA_VERSION" FRIDA_CORE_DEVKIT="$HOME/devkit" pip install --force-reinstall .
           cd "$HOME"
           rm -rf frida-python-android
 
-          # ----- 7. Install frida-tools with version constraints -----
+          # ----- 6. Install frida-tools with version constraints -----
           if [ -n "$FRIDA_TOOLS_VERSION_INPUT" ] && [ "$FRIDA_TOOLS_VERSION_INPUT" != "automatic" ]; then
-              pip install --upgrade frida-tools=="$FRIDA_TOOLS_VERSION_INPUT"
+            pip install --upgrade frida-tools=="$FRIDA_TOOLS_VERSION_INPUT"
           else
-              pip install --upgrade frida-tools"$TOOLS_VERSION"
+            pip install --upgrade frida-tools"$FTOOLS_VERSION"
           fi
 
           # Verify tools are available
           which frida
           which frida-ls
 
-          # ----- 8. Package into .deb -----
+          # ----- 7. Prepare staging directory for packaging -----
           PREFIX=/data/data/com.termux/files/usr
-          # Find Python site-packages path
           PYTHON_SITE=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
           STAGING_DIR="$HOME/deb-root"
           mkdir -p "$STAGING_DIR$PREFIX"
@@ -155,12 +186,12 @@ jobs:
           mkdir -p "$STAGING_DIR$PYTHON_SITE"
           cp -r "$PYTHON_SITE"/* "$STAGING_DIR$PYTHON_SITE/"
 
-          # Copy Frida binaries (frida, frida-ls, etc.)
+          # Copy Frida binaries
           mkdir -p "$STAGING_DIR$PREFIX/bin"
           for f in "$PREFIX"/bin/frida*; do
-              if [ -f "$f" ]; then
-                  cp "$f" "$STAGING_DIR$PREFIX/bin/"
-              fi
+            if [ -f "$f" ]; then
+              cp "$f" "$STAGING_DIR$PREFIX/bin/"
+            fi
           done
 
           # Adjust shebangs to Termux Python path
@@ -169,7 +200,6 @@ jobs:
 
           # Create DEBIAN control
           mkdir -p "$STAGING_DIR/DEBIAN"
-          # Sanitize version for Debian package (remove leading 'v' if present)
           VERSION=$(echo "$FRIDA_VERSION" | sed 's/^v//')
           cat > "$STAGING_DIR/DEBIAN/control" <<EOC
           Package: frida-tools-termux
@@ -189,17 +219,18 @@ jobs:
           EOP
           chmod +x "$STAGING_DIR/DEBIAN/postinst"
 
-          # Build the .deb package
-          cd "$HOME"
-          dpkg-deb --build "$STAGING_DIR" "frida-tools-termux_${VERSION}_arm.deb"
-          echo "Package built: $HOME/frida-tools-termux_${VERSION}_arm.deb"
+          # The .deb will be built on the host after exiting chroot
+          echo "Staging directory prepared at $STAGING_DIR"
           EOF
 
-          # ----- 3. Copy the .deb from rootfs to host for artifact upload -----
-          mkdir -p "$GITHUB_WORKSPACE/output"
-          cp "$ROOTFS_DIR/data/data/com.termux/files/home/"frida-tools-termux_*.deb "$GITHUB_WORKSPACE/output/"
-          echo "Deb package copied to $GITHUB_WORKSPACE/output/"
-          ls -l "$GITHUB_WORKSPACE/output/"
+          # ----- 3. Build the .deb package on host -----
+          # The staging dir is inside the rootfs at the Termux home directory
+          STAGING_DIR="$ROOTFS_DIR/data/data/com.termux/files/home/deb-root"
+          OUTPUT_DIR="$GITHUB_WORKSPACE/output"
+          mkdir -p "$OUTPUT_DIR"
+          dpkg-deb --build "$STAGING_DIR" "$OUTPUT_DIR/frida-tools-termux_${VERSION}_arm.deb"
+          echo "Package built: $OUTPUT_DIR/frida-tools-termux_${VERSION}_arm.deb"
+          ls -l "$OUTPUT_DIR/"
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
