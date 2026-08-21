@@ -121,21 +121,20 @@ jobs:
           fi
 
           # Run build inside chroot environment.
-          # Use env -i to clear host environment and set required variables.
-          chroot "$ROOTFS_DIR" /data/data/com.termux/files/usr/bin/env \
-            -i \
-            HOME=/data/data/com.termux/files/home \
-            PATH=/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets \
-            FRIDA_VERSION="$FRIDA_VERSION" \
-            VERSION="$VERSION" \
-            FTOOLS_VERSION="$FTOOLS_VERSION" \
-            FRIDA_TOOLS_VERSION_INPUT="$FRIDA_TOOLS_VERSION_INPUT" \
-            /data/data/com.termux/files/usr/bin/bash -s <<'EOF'
+          # No need for 'env' because chroot inherits the current environment.
+          # We set HOME and PATH inside the chroot via the heredoc.
+          chroot "$ROOTFS_DIR" /data/data/com.termux/files/usr/bin/bash -s <<'EOF'
           set -e
 
+          # Set basic environment
           export HOME=/data/data/com.termux/files/home
           export PATH="$HOME/bin:/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets:$PATH"
           mkdir -p "$HOME"
+
+          # The environment variables FRIDA_VERSION, VERSION, FTOOLS_VERSION,
+          # and FRIDA_TOOLS_VERSION_INPUT are inherited from the outer shell.
+          echo "FRIDA_VERSION inside chroot: $FRIDA_VERSION"
+          echo "FTOOLS_VERSION inside chroot: $FTOOLS_VERSION"
 
           pkg update -y
           pkg upgrade -y
