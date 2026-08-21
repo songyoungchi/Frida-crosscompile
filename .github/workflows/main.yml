@@ -18,8 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      # Official Termux package builder image includes qemu-user-static and binfmt support.
-      # Run as root with privileged mode to allow proot and binfmt.
+      # Official Termux package builder image (includes qemu-user-static and binfmt support)
       image: ghcr.io/termux/package-builder:latest
       options: --privileged --user root
 
@@ -29,7 +28,7 @@ jobs:
 
       - name: Install host dependencies (proot, curl, unzip)
         run: |
-          # Create apt partial directory if missing (fixes apt-get update error)
+          # Create apt partial directory if missing (fixes apt-get update error in some containers)
           mkdir -p /var/lib/apt/lists/partial
           apt-get update
           apt-get install -y proot curl unzip
@@ -46,9 +45,7 @@ jobs:
           # ----- 1. Prepare Termux rootfs for arm (ARMv7) -----
           ARCH=arm
           ROOTFS_DIR="$PWD/termux-rootfs"
-          # Create the full Termux prefix path inside the rootfs.
-          # The bootstrap zip contains the contents of the prefix (bin, lib, etc.)
-          # and is intended to be extracted into /data/data/com.termux/files/usr.
+          # Termux prefix path inside the rootfs
           PREFIX_DIR="$ROOTFS_DIR/data/data/com.termux/files/usr"
           mkdir -p "$PREFIX_DIR"
 
@@ -56,22 +53,24 @@ jobs:
           BOOTSTRAP_URL="https://github.com/termux/termux-packages/releases/latest/download/bootstrap-${ARCH}.zip"
           echo "Downloading Termux bootstrap from $BOOTSTRAP_URL"
           curl -L -o bootstrap.zip "$BOOTSTRAP_URL"
-          # Extract directly into the prefix directory
+          # Extract bootstrap contents directly into the prefix (standard Termux layout)
           unzip -q bootstrap.zip -d "$PREFIX_DIR"
           rm bootstrap.zip
 
-          # Set up basic files for proot (resolv.conf, etc.)
-          mkdir -p "$ROOTFS_DIR/etc"
+          # Set up basic files for proot
+          mkdir -p "$ROOTFS_DIR/etc" "$ROOTFS_DIR/data/data/com.termux/files/home"
           cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf" 2>/dev/null || true
-          # Create home directory as per Termux layout
-          mkdir -p "$ROOTFS_DIR/data/data/com.termux/files/home"
+
+          # Locate qemu-arm-static (required to run ARM binaries in proot)
+          QEMU_BIN=$(which qemu-arm-static)
+          echo "Using qemu-arm-static: $QEMU_BIN"
 
           # ----- 2. Build inside ARM Termux environment using proot -----
-          # proot provides a virtual root without requiring a full Linux rootfs.
-          # We bind /dev, /proc, /sys to mimic a real Android environment.
-          # The working directory is set to the Termux home.
+          # proot provides a virtual root and uses qemu to execute ARM binaries.
+          # Bind /dev, /proc, /sys to mimic a real environment.
           proot -S "$ROOTFS_DIR" \
                 -b /dev -b /proc -b /sys \
+                -q "$QEMU_BIN" \
                 -w /data/data/com.termux/files/home \
                 /data/data/com.termux/files/usr/bin/bash -s <<'EOF'
           set -e
@@ -83,7 +82,6 @@ jobs:
           # Basic setup inside Termux
           export HOME=/data/data/com.termux/files/home
           export PATH="$HOME/bin:/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets:$PATH"
-          # Create home if not exists (should be already)
           mkdir -p "$HOME"
 
           pkg update -y
@@ -171,7 +169,7 @@ jobs:
 
           # Create DEBIAN control
           mkdir -p "$STAGING_DIR/DEBIAN"
-          # Sanitize version for Debian package
+          # Sanitize version for Debian package (remove leading 'v' if present)
           VERSION=$(echo "$FRIDA_VERSION" | sed 's/^v//')
           cat > "$STAGING_DIR/DEBIAN/control" <<EOC
           Package: frida-tools-termux
