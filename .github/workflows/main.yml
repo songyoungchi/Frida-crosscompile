@@ -1,5 +1,5 @@
 # .github/workflows/build-frida-termux-deb.yml
-# Builds a .deb package of frida-tools for Termux (Android ARMv7) using official pre-built wheels.
+# Builds a .deb package of frida-tools for Termux (Android ARMv7)
 
 name: Build Frida Termux DEB
 
@@ -79,10 +79,10 @@ jobs:
           mv frida-python-android-arm.whl wheels/
 
       # ============================================
-      # Install frida-tools and dependencies
+      # Install frida-tools and dependencies (offline)
       # ============================================
 
-      - name: Install frida-tools with pip (targeting Android ARM)
+      - name: Install frida-tools offline
         run: |
           FRIDA_VERSION="${{ steps.frida_version.outputs.version }}"
           FRIDA_VERSION="${FRIDA_VERSION#v}"
@@ -92,27 +92,16 @@ jobs:
           TEMP_INSTALL="${{ github.workspace }}/temp_install"
           mkdir -p "$TEMP_INSTALL"
 
-          # Build the pip install command
-          # --prefix places packages under $TEMP_INSTALL/usr (lib/python3.10/site-packages and bin)
-          # --platform android_arm forces the target architecture
-          # --find-links points to our local wheel directory
-          # --only-binary :all: prevents building from source
-          PIP_CMD="pip install --prefix $TEMP_INSTALL/usr \
-                    --platform android_arm \
-                    --python-version 3.10 \
-                    --implementation cp \
-                    --only-binary :all: \
-                    --find-links ${{ github.workspace }}/wheels"
+          # Build the pip install command using --target
+          PIP_CMD="pip install --target $TEMP_INSTALL/usr/lib/python3.10/site-packages \
+                    --find-links ${{ github.workspace }}/wheels \
+                    --no-index"
 
           if [ -n "$FRIDA_TOOLS_VERSION" ]; then
             # Use the specified version
             $PIP_CMD frida-tools=="$FRIDA_TOOLS_VERSION"
           else
             # Determine version constraint based on Frida version
-            # For Frida > 17.0.7, install latest frida-tools
-            # For 17.0.0 - 17.0.7, use <=14.0.2
-            # For < 17.0.0, use <=13.7.1
-            # (Logic mirrors the original Termux script)
             version_ge() {
               [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" != "$1" ]
             }
@@ -127,8 +116,23 @@ jobs:
             fi
           fi
 
+          # Copy console scripts (binaries) to the correct location
+          # Pip installs scripts to the 'bin' directory relative to the target
+          BIN_DIR="$TEMP_INSTALL/usr/bin"
+          mkdir -p "$BIN_DIR"
+          # Find and copy frida-* scripts from the Python scripts directory
+          SCRIPTS_DIR=$(python -c "import sys; print(sys.prefix)/bin")
+          for script in frida frida-*; do
+            if [ -f "$SCRIPTS_DIR/$script" ]; then
+              cp "$SCRIPTS_DIR/$script" "$BIN_DIR/"
+            fi
+          done
+
+          # Make binaries executable
+          chmod +x "$BIN_DIR/"* 2>/dev/null || true
+
           # Verify installation
-          ls -la "$TEMP_INSTALL/usr/bin" || true
+          ls -la "$BIN_DIR" || true
           ls -la "$TEMP_INSTALL/usr/lib/python3.10/site-packages" || true
 
       # ============================================
