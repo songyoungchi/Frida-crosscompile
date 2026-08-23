@@ -1,20 +1,13 @@
 # .github/workflows/build-frida-termux-deb.yml
-# GitHub Actions workflow to build frida-tools .deb package for Termux on Android ARMv7
-#
-# This workflow automates the process described in the Termux installation script:
-# 1. Downloads the appropriate frida-core-devkit for Android ARM
-# 2. Installs frida-python using the devkit
-# 3. Installs frida-tools via pip
-# 4. Packages the installed files into a .deb file for Termux
+# Builds a .deb package of frida-tools for Termux (Android ARMv7) using official pre-built wheels.
 
 name: Build Frida Termux DEB
 
 on:
-  # Allow manual trigger with version specification
   workflow_dispatch:
     inputs:
       frida_version:
-        description: 'Frida version to build (e.g., 17.0.7). Leave empty for latest.'
+        description: 'Frida version to build (e.g., 17.17.0). Leave empty for latest.'
         required: false
         default: ''
         type: string
@@ -23,10 +16,6 @@ on:
         required: false
         default: ''
         type: string
-  # Automatically run on push to main branch (optional)
-  # push:
-  #   branches:
-  #     - main
 
 jobs:
   build:
@@ -36,11 +25,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ============================================
-      # Environment Setup
-      # ============================================
-
-      - name: Set up Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
@@ -49,15 +34,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            xz-utils \
             curl \
             git \
             file \
             dpkg \
-            fakeroot
+            fakeroot \
+            unzip
 
       # ============================================
-      # Determine Frida Version
+      # Determine Frida version
       # ============================================
 
       - name: Get latest Frida version (if not specified)
@@ -73,176 +58,148 @@ jobs:
           fi
 
       # ============================================
-      # Download and Extract Frida Core Devkit
+      # Download frida-python wheel for Android ARM
       # ============================================
 
-      - name: Download frida-core-devkit for Android ARM
+      - name: Download frida-python wheel
         run: |
           FRIDA_VERSION="${{ steps.frida_version.outputs.version }}"
-          # For ARMv7, the devkit uses "arm" architecture
-          DEVKIT_URL="https://github.com/frida/frida/releases/download/$FRIDA_VERSION/frida-core-devkit-$FRIDA_VERSION-android-arm.tar.xz"
-          echo "Downloading from: $DEVKIT_URL"
-          curl -L -o frida-core-devkit-android-arm.tar.xz "$DEVKIT_URL"
-
-      - name: Extract devkit
-        run: |
-          mkdir -p "$HOME/devkit"
-          tar -xvf frida-core-devkit-android-arm.tar.xz -C "$HOME/devkit"
-          rm -f frida-core-devkit-android-arm.tar.xz
-          echo "Devkit extracted to $HOME/devkit"
-
-      # ============================================
-      # Clone and Install frida-python with Devkit
-      # ============================================
-
-      - name: Clone and install frida-python
-        run: |
-          FRIDA_VERSION="${{ steps.frida_version.outputs.version }}"
-          # Version comparison function (bash approximation)
-          version_ge() {
-            # Returns 0 if $1 >= $2
-            [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" != "$1" ]
-          }
-
-          # Determine which branch to use based on Frida version
-          if version_ge "17.0.7" "$FRIDA_VERSION"; then
-            # For versions <= 17.0.7, use the 17.0.7 branch
-            git clone https://github.com/AbhiTheModder/frida-python frida-python-android -b 17.0.7
-          else
-            # For newer versions, use main branch
-            git clone https://github.com/AbhiTheModder/frida-python frida-python-android
+          # Remove leading 'v' if present
+          FRIDA_VERSION="${FRIDA_VERSION#v}"
+          PYTHON_TAG="cp310"  # matches our Python 3.10
+          WHEEL_URL="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-python-${FRIDA_VERSION}-android-arm-${PYTHON_TAG}.whl"
+          echo "Downloading $WHEEL_URL"
+          curl -L -o frida-python-android-arm.whl "$WHEEL_URL"
+          # Verify the file exists
+          if [ ! -f frida-python-android-arm.whl ]; then
+            echo "Error: Failed to download wheel for $FRIDA_VERSION"
+            exit 1
           fi
-
-          cd frida-python-android
-          FRIDA_VERSION="$FRIDA_VERSION" FRIDA_CORE_DEVKIT="$HOME/devkit" pip install --force-reinstall .
-          cd ..
-          rm -rf frida-python-android
+          mkdir -p wheels
+          mv frida-python-android-arm.whl wheels/
 
       # ============================================
-      # Install frida-tools
+      # Install frida-tools and dependencies
       # ============================================
 
-      - name: Install frida-tools
+      - name: Install frida-tools with pip (targeting Android ARM)
         run: |
           FRIDA_VERSION="${{ steps.frida_version.outputs.version }}"
+          FRIDA_VERSION="${FRIDA_VERSION#v}"
           FRIDA_TOOLS_VERSION="${{ inputs.frida_tools_version }}"
 
-          # Version comparison helper
-          version_ge() {
-            [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" != "$1" ]
-          }
+          # Create a temporary installation root
+          TEMP_INSTALL="${{ github.workspace }}/temp_install"
+          mkdir -p "$TEMP_INSTALL"
+
+          # Build the pip install command
+          # --prefix places packages under $TEMP_INSTALL/usr (lib/python3.10/site-packages and bin)
+          # --platform android_arm forces the target architecture
+          # --find-links points to our local wheel directory
+          # --only-binary :all: prevents building from source
+          PIP_CMD="pip install --prefix $TEMP_INSTALL/usr \
+                    --platform android_arm \
+                    --python-version 3.10 \
+                    --implementation cp \
+                    --only-binary :all: \
+                    --find-links ${{ github.workspace }}/wheels"
 
           if [ -n "$FRIDA_TOOLS_VERSION" ]; then
-            # Use specified version
-            pip install --upgrade frida-tools=="$FRIDA_TOOLS_VERSION"
-          elif version_ge "17.0.7" "$FRIDA_VERSION"; then
-            if version_ge "17.0.0" "$FRIDA_VERSION"; then
-              # Versions between 17.0.0 and 17.0.7
-              pip install --upgrade "frida-tools<=14.0.2"
-            else
-              # Versions < 17.0.0
-              pip install --upgrade "frida-tools<=13.7.1"
-            fi
+            # Use the specified version
+            $PIP_CMD frida-tools=="$FRIDA_TOOLS_VERSION"
           else
-            # Versions > 17.0.7
-            pip install --upgrade frida-tools
+            # Determine version constraint based on Frida version
+            # For Frida > 17.0.7, install latest frida-tools
+            # For 17.0.0 - 17.0.7, use <=14.0.2
+            # For < 17.0.0, use <=13.7.1
+            # (Logic mirrors the original Termux script)
+            version_ge() {
+              [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" != "$1" ]
+            }
+            if version_ge "17.0.7" "$FRIDA_VERSION"; then
+              if version_ge "17.0.0" "$FRIDA_VERSION"; then
+                $PIP_CMD "frida-tools<=14.0.2"
+              else
+                $PIP_CMD "frida-tools<=13.7.1"
+              fi
+            else
+              $PIP_CMD frida-tools
+            fi
           fi
 
+          # Verify installation
+          ls -la "$TEMP_INSTALL/usr/bin" || true
+          ls -la "$TEMP_INSTALL/usr/lib/python3.10/site-packages" || true
+
       # ============================================
-      # Prepare Files for .deb Packaging
+      # Stage files for .deb packaging
       # ============================================
 
-      - name: Prepare package files
+      - name: Prepare package staging
         run: |
-          PKG_NAME="frida-tools"
-          PKG_VERSION="${{ steps.frida_version.outputs.version }}"
-          # Remove leading 'v' if present
-          PKG_VERSION="${PKG_VERSION#v}"
-          PKG_ARCH="arm"
+          FRIDA_VERSION="${{ steps.frida_version.outputs.version }}"
+          FRIDA_VERSION="${FRIDA_VERSION#v}"
+          TEMP_INSTALL="${{ github.workspace }}/temp_install"
+          STAGING_DIR="${{ github.workspace }}/staging"
 
-          # Create staging directory with Termux prefix
-          # Termux uses /data/data/com.termux/files/usr as prefix
-          STAGING_DIR="${{ github.workspace }}/staging/data/data/com.termux/files/usr"
-          mkdir -p "$STAGING_DIR"
+          # Create the Termux prefix structure
+          mkdir -p "$STAGING_DIR/data/data/com.termux/files/usr"
 
-          # Copy installed Python packages from pip to staging
-          # Find the site-packages directory
-          SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          echo "Site packages: $SITE_PACKAGES"
+          # Copy installed Python packages and scripts
+          cp -r "$TEMP_INSTALL/usr/lib" "$STAGING_DIR/data/data/com.termux/files/usr/"
+          cp -r "$TEMP_INSTALL/usr/bin" "$STAGING_DIR/data/data/com.termux/files/usr/"
 
-          # Copy frida and frida_tools packages
-          cp -r "$SITE_PACKAGES/frida" "$STAGING_DIR/lib/python3.10/site-packages/" 2>/dev/null || true
-          cp -r "$SITE_PACKAGES/frida_tools" "$STAGING_DIR/lib/python3.10/site-packages/" 2>/dev/null || true
-
-          # Copy console scripts (binaries)
-          mkdir -p "$STAGING_DIR/bin"
-          # Find and copy frida-* scripts from bin directory
-          BIN_DIR=$(python -c "import sys; print(sys.exec_prefix)/bin")
-          for script in frida frida-*; do
-            if [ -f "$BIN_DIR/$script" ]; then
-              cp "$BIN_DIR/$script" "$STAGING_DIR/bin/"
-            fi
-          done
-
-          # Also check for scripts in Python's scripts directory
-          SCRIPTS_DIR=$(python -c "import sys; print(sys.prefix)/bin")
-          for script in frida frida-*; do
-            if [ -f "$SCRIPTS_DIR/$script" ]; then
-              cp "$SCRIPTS_DIR/$script" "$STAGING_DIR/bin/"
-            fi
-          done
-
-          # Make binaries executable
-          chmod +x "$STAGING_DIR/bin/"* 2>/dev/null || true
+          # Ensure scripts are executable
+          chmod +x "$STAGING_DIR/data/data/com.termux/files/usr/bin/"* || true
 
           # Create DEBIAN control directory
-          DEBIAN_DIR="${{ github.workspace }}/staging/DEBIAN"
+          DEBIAN_DIR="$STAGING_DIR/DEBIAN"
           mkdir -p "$DEBIAN_DIR"
 
-          # Create control file
+          # Generate control file
           cat > "$DEBIAN_DIR/control" << EOF
-          Package: $PKG_NAME
-          Version: $PKG_VERSION
-          Architecture: $PKG_ARCH
+          Package: frida-tools
+          Version: $FRIDA_VERSION
+          Architecture: arm
           Maintainer: GitHub Actions <actions@github.com>
           Depends: python3
           Description: Frida tools for Termux on Android ARMv7
-           Frida is a dynamic instrumentation toolkit for developers, reverse-engineers,
-           and security researchers. This package includes frida-tools CLI utilities.
+           Frida is a dynamic instrumentation toolkit for developers,
+           reverse-engineers, and security researchers.
+           This package includes the frida-tools CLI utilities.
           Homepage: https://frida.re
           EOF
 
-          # Create md5sums file
-          cd "${{ github.workspace }}/staging"
+          # Generate md5sums for all files (excluding DEBIAN)
+          cd "$STAGING_DIR"
           find . -type f ! -path "./DEBIAN/*" -exec md5sum {} \; > "$DEBIAN_DIR/md5sums"
 
       # ============================================
-      # Build .deb Package
+      # Build .deb package
       # ============================================
 
-      - name: Build .deb package
+      - name: Build .deb
         run: |
-          PKG_VERSION="${{ steps.frida_version.outputs.version }}"
-          PKG_VERSION="${PKG_VERSION#v}"
+          FRIDA_VERSION="${{ steps.frida_version.outputs.version }}"
+          FRIDA_VERSION="${FRIDA_VERSION#v}"
+          STAGING_DIR="${{ github.workspace }}/staging"
           PKG_NAME="frida-tools"
           PKG_ARCH="arm"
 
-          # Use dpkg-deb to build the package
-          cd "${{ github.workspace }}/staging"
           # Fix permissions
-          find . -type d -exec chmod 755 {} \;
-          find . -type f -exec chmod 644 {} \;
-          chmod 755 ./data/data/com.termux/files/usr/bin/* 2>/dev/null || true
+          find "$STAGING_DIR" -type d -exec chmod 755 {} \;
+          find "$STAGING_DIR" -type f -exec chmod 644 {} \;
+          chmod 755 "$STAGING_DIR/data/data/com.termux/files/usr/bin/"* 2>/dev/null || true
 
           # Build the .deb
           cd "${{ github.workspace }}"
-          dpkg-deb --build staging "${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.deb"
+          dpkg-deb --build "$STAGING_DIR" "${PKG_NAME}_${FRIDA_VERSION}_${PKG_ARCH}.deb"
 
-          # Verify the package
-          file "${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.deb"
+          # Verify
+          file "${PKG_NAME}_${FRIDA_VERSION}_${PKG_ARCH}.deb"
 
       # ============================================
-      # Upload Artifacts
+      # Upload artifact
       # ============================================
 
       - name: Upload .deb artifact
@@ -251,11 +208,3 @@ jobs:
           name: frida-tools-termux-arm
           path: frida-tools_*.deb
           retention-days: 30
-
-      - name: Upload .deb to release (optional)
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: frida-tools-deb
-          path: frida-tools_*.deb
-          retention-days: 90
