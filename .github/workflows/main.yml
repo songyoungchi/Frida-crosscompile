@@ -1,7 +1,5 @@
 # .github/workflows/build-frida-termux-deb.yml
-# Builds a .deb package of frida-tools for Termux (Android ARMv7) using QEMU emulation.
-# The build runs inside an ARMv7 Debian container, which allows frida-python to be
-# compiled natively for the target architecture using the Frida Core DevKit.
+# Builds frida-tools .deb for Termux (Android ARMv7) using QEMU and a virtual environment.
 
 name: Build Frida Termux DEB
 
@@ -9,12 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       frida_version:
-        description: 'Frida version to build (e.g., 17.17.0). Leave empty for latest.'
+        description: 'Frida version (e.g., 17.17.0). Leave empty for latest.'
         required: false
         default: ''
         type: string
       frida_tools_version:
-        description: 'Specific frida-tools version (e.g., 13.6.1). Leave empty for latest compatible.'
+        description: 'Specific frida-tools version. Leave empty for latest compatible.'
         required: false
         default: ''
         type: string
@@ -27,72 +25,56 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ============================================
-      # Set up QEMU for ARMv7 emulation
-      # ============================================
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      # ============================================
-      # Determine Frida version
-      # ============================================
-
-      - name: Get latest Frida version (if not specified)
+      - name: Determine Frida version
         id: frida_version
         run: |
           if [ -z "${{ inputs.frida_version }}" ]; then
             FRIDA_VERSION=$(curl --silent "https://api.github.com/repos/frida/frida/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
             echo "version=$FRIDA_VERSION" >> $GITHUB_OUTPUT
-            echo "Using latest Frida version: $FRIDA_VERSION"
           else
             echo "version=${{ inputs.frida_version }}" >> $GITHUB_OUTPUT
-            echo "Using specified Frida version: ${{ inputs.frida_version }}"
           fi
 
-      # ============================================
-      # Build inside ARMv7 container
-      # ============================================
-
-      - name: Build frida-tools in ARMv7 container
+      - name: Build inside ARMv7 container with venv
         id: build
         run: |
           FRIDA_VERSION="${{ steps.frida_version.outputs.version }}"
           FRIDA_VERSION="${FRIDA_VERSION#v}"
           FRIDA_TOOLS_VERSION="${{ inputs.frida_tools_version }}"
 
-          # Run the build inside an ARMv7 Debian container
           docker run --rm --platform linux/arm/v7 \
             -v "$PWD:/workspace" \
             -w /workspace \
             arm32v7/debian:bookworm-slim \
             bash -c "
               set -e
+              export DEBIAN_FRONTEND=noninteractive
 
-              echo '=== Installing build dependencies ==='
+              echo '=== Installing system dependencies ==='
               apt-get update
               apt-get install -y --no-install-recommends \
-                python3 python3-pip python3-dev python3-venv \
+                python3 python3-pip python3-venv python3-dev \
                 git curl xz-utils build-essential pkg-config \
                 libssl-dev
 
-              # Use python3 as default python
-              ln -sf /usr/bin/python3 /usr/bin/python
+              # Create a virtual environment
+              python3 -m venv /venv
+              source /venv/bin/activate
 
-              echo '=== Installing Python packages ==='
-              pip3 install --upgrade pip setuptools wheel
+              echo '=== Installing Python build tools ==='
+              pip install --upgrade pip setuptools wheel
 
               echo '=== Downloading Frida Core DevKit ==='
               DEVKIT_URL=\"https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-core-devkit-${FRIDA_VERSION}-android-arm.tar.xz\"
-              echo \"Downloading from: \$DEVKIT_URL\"
               curl -L -o frida-core-devkit-android-arm.tar.xz \"\$DEVKIT_URL\"
-
               mkdir -p /root/devkit
               tar -xvf frida-core-devkit-android-arm.tar.xz -C /root/devkit
               rm -f frida-core-devkit-android-arm.tar.xz
 
               echo '=== Cloning and building frida-python ==='
-              # Determine which branch to use based on Frida version
               version_ge() {
                 [ \"\$(printf '%s\n' \"\$1\" \"\$2\" | sort -V | head -n1)\" != \"\$1\" ]
               }
@@ -104,66 +86,51 @@ jobs:
               fi
 
               cd frida-python-android
-              FRIDA_VERSION=\"$FRIDA_VERSION\" FRIDA_CORE_DEVKIT=\"/root/devkit\" pip3 install --force-reinstall .
+              FRIDA_VERSION=\"$FRIDA_VERSION\" FRIDA_CORE_DEVKIT=\"/root/devkit\" pip install --force-reinstall .
               cd ..
               rm -rf frida-python-android
 
               echo '=== Installing frida-tools ==='
               if [ -n \"$FRIDA_TOOLS_VERSION\" ]; then
-                pip3 install --upgrade frida-tools==\"$FRIDA_TOOLS_VERSION\"
+                pip install --upgrade frida-tools==\"$FRIDA_TOOLS_VERSION\"
               else
                 if version_ge \"17.0.7\" \"$FRIDA_VERSION\"; then
                   if version_ge \"17.0.0\" \"$FRIDA_VERSION\"; then
-                    pip3 install --upgrade 'frida-tools<=14.0.2'
+                    pip install --upgrade 'frida-tools<=14.0.2'
                   else
-                    pip3 install --upgrade 'frida-tools<=13.7.1'
+                    pip install --upgrade 'frida-tools<=13.7.1'
                   fi
                 else
-                  pip3 install --upgrade frida-tools
+                  pip install --upgrade frida-tools
                 fi
               fi
 
               echo '=== Verifying installation ==='
-              python3 -c 'import frida; print(frida.__version__)'
+              python -c 'import frida; print(frida.__version__)'
               frida --version || true
 
-              echo '=== Copying installed files to staging ==='
-              # Create staging directory with Termux prefix
+              echo '=== Preparing staging directory ==='
               STAGING_DIR=\"/workspace/staging/data/data/com.termux/files/usr\"
-              mkdir -p \"\$STAGING_DIR\"
-
-              # Find the site-packages directory
-              SITE_PACKAGES=\$(python3 -c \"import site; print(site.getsitepackages()[0])\")
-              echo \"Site packages: \$SITE_PACKAGES\"
-
-              # Copy frida and frida_tools packages
-              cp -r \"\$SITE_PACKAGES/frida\" \"\$STAGING_DIR/lib/python3.11/site-packages/\" 2>/dev/null || true
-              cp -r \"\$SITE_PACKAGES/frida_tools\" \"\$STAGING_DIR/lib/python3.11/site-packages/\" 2>/dev/null || true
-
-              # Copy console scripts
+              mkdir -p \"\$STAGING_DIR/lib/python3.11/site-packages\"
               mkdir -p \"\$STAGING_DIR/bin\"
-              # Find scripts in the bin directory of the Python installation
-              BIN_DIR=\$(python3 -c \"import sys; print(sys.exec_prefix)\")/bin
-              for script in frida frida-*; do
-                if [ -f \"\$BIN_DIR/\$script\" ]; then
-                  cp \"\$BIN_DIR/\$script\" \"\$STAGING_DIR/bin/\"
-                fi
+
+              # Copy site-packages from venv
+              VENV_SITE=\$(python -c \"import site; print(site.getsitepackages()[0])\")
+              cp -r \"\$VENV_SITE/frida\" \"\$STAGING_DIR/lib/python3.11/site-packages/\"
+              cp -r \"\$VENV_SITE/frida_tools\" \"\$STAGING_DIR/lib/python3.11/site-packages/\"
+
+              # Copy bin scripts and fix shebang
+              for script in /venv/bin/frida*; do
+                [ -f \"\$script\" ] || continue
+                cp \"\$script\" \"\$STAGING_DIR/bin/\"
+                # Replace shebang with Termux Python path
+                sed -i '1s|^#!/.*python.*|#!/data/data/com.termux/files/usr/bin/python3|' \"\$STAGING_DIR/bin/\$(basename \"\$script\")\"
               done
+              chmod +x \"\$STAGING_DIR/bin/\"*
 
-              # Also check the scripts directory
-              SCRIPTS_DIR=\$(python3 -c \"import sys; print(sys.prefix)\")/bin
-              for script in frida frida-*; do
-                if [ -f \"\$SCRIPTS_DIR/\$script\" ]; then
-                  cp \"\$SCRIPTS_DIR/\$script\" \"\$STAGING_DIR/bin/\"
-                fi
-              done
-
-              chmod +x \"\$STAGING_DIR/bin/\"* 2>/dev/null || true
-
-              echo '=== Creating DEBIAN control files ==='
+              echo '=== Creating DEBIAN control ==='
               DEBIAN_DIR=\"/workspace/staging/DEBIAN\"
               mkdir -p \"\$DEBIAN_DIR\"
-
               cat > \"\$DEBIAN_DIR/control\" << EOF
               Package: frida-tools
               Version: $FRIDA_VERSION
@@ -179,13 +146,7 @@ jobs:
 
               cd /workspace/staging
               find . -type f ! -path \"./DEBIAN/*\" -exec md5sum {} \; > \"\$DEBIAN_DIR/md5sums\"
-
-              echo '=== Build completed successfully ==='
             "
-
-      # ============================================
-      # Build .deb package
-      # ============================================
 
       - name: Build .deb
         run: |
@@ -195,21 +156,13 @@ jobs:
           PKG_NAME="frida-tools"
           PKG_ARCH="arm"
 
-          # Fix permissions
           find "$STAGING_DIR" -type d -exec chmod 755 {} \;
           find "$STAGING_DIR" -type f -exec chmod 644 {} \;
           chmod 755 "$STAGING_DIR/data/data/com.termux/files/usr/bin/"* 2>/dev/null || true
 
-          # Build the .deb
           cd "${{ github.workspace }}"
           dpkg-deb --build "$STAGING_DIR" "${PKG_NAME}_${FRIDA_VERSION}_${PKG_ARCH}.deb"
-
-          # Verify
           file "${PKG_NAME}_${FRIDA_VERSION}_${PKG_ARCH}.deb"
-
-      # ============================================
-      # Upload artifact
-      # ============================================
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
