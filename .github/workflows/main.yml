@@ -1,5 +1,5 @@
 # .github/workflows/build-frida-termux-deb.yml
-# Builds a .deb package of frida-tools for Termux (Android ARMv7)
+# Builds a .deb package of frida-tools for Termux (Android ARMv7) using official pre-built wheels.
 
 name: Build Frida Termux DEB
 
@@ -38,8 +38,7 @@ jobs:
             git \
             file \
             dpkg \
-            fakeroot \
-            unzip
+            fakeroot
 
       # ============================================
       # Determine Frida version
@@ -70,7 +69,6 @@ jobs:
           WHEEL_URL="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-python-${FRIDA_VERSION}-android-arm-${PYTHON_TAG}.whl"
           echo "Downloading $WHEEL_URL"
           curl -L -o frida-python-android-arm.whl "$WHEEL_URL"
-          # Verify the file exists
           if [ ! -f frida-python-android-arm.whl ]; then
             echo "Error: Failed to download wheel for $FRIDA_VERSION"
             exit 1
@@ -79,61 +77,88 @@ jobs:
           mv frida-python-android-arm.whl wheels/
 
       # ============================================
-      # Install frida-tools and dependencies (offline)
+      # Install frida-tools and dependencies using --target
       # ============================================
 
-      - name: Install frida-tools offline
+      - name: Install frida-tools with pip (targeting Android ARM)
         run: |
           FRIDA_VERSION="${{ steps.frida_version.outputs.version }}"
           FRIDA_VERSION="${FRIDA_VERSION#v}"
           FRIDA_TOOLS_VERSION="${{ inputs.frida_tools_version }}"
 
-          # Create a temporary installation root
+          # Temporary installation root
           TEMP_INSTALL="${{ github.workspace }}/temp_install"
-          mkdir -p "$TEMP_INSTALL"
+          mkdir -p "$TEMP_INSTALL/usr/lib/python3.10/site-packages"
 
-          # Build the pip install command using --target
-          PIP_CMD="pip install --target $TEMP_INSTALL/usr/lib/python3.10/site-packages \
+          # Build the pip install command with --target
+          PIP_TARGET="$TEMP_INSTALL/usr/lib/python3.10/site-packages"
+          PIP_CMD="pip install --target $PIP_TARGET \
+                    --platform android_arm \
+                    --python-version 3.10 \
+                    --implementation cp \
+                    --only-binary :all: \
                     --find-links ${{ github.workspace }}/wheels \
-                    --no-index"
+                    --no-deps"  # We'll install frida-tools with its dependencies separately
 
+          # First, install frida from the local wheel (this also pulls in its dependencies if any)
+          # Actually, frida-python has no dependencies, but we'll install it first
+          $PIP_CMD frida
+
+          # Now determine frida-tools version constraint
           if [ -n "$FRIDA_TOOLS_VERSION" ]; then
-            # Use the specified version
-            $PIP_CMD frida-tools=="$FRIDA_TOOLS_VERSION"
+            TOOLS_SPEC="frida-tools==$FRIDA_TOOLS_VERSION"
           else
-            # Determine version constraint based on Frida version
             version_ge() {
               [ "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" != "$1" ]
             }
             if version_ge "17.0.7" "$FRIDA_VERSION"; then
               if version_ge "17.0.0" "$FRIDA_VERSION"; then
-                $PIP_CMD "frida-tools<=14.0.2"
+                TOOLS_SPEC="frida-tools<=14.0.2"
               else
-                $PIP_CMD "frida-tools<=13.7.1"
+                TOOLS_SPEC="frida-tools<=13.7.1"
               fi
             else
-              $PIP_CMD frida-tools
+              TOOLS_SPEC="frida-tools"
             fi
           fi
 
-          # Copy console scripts (binaries) to the correct location
-          # Pip installs scripts to the 'bin' directory relative to the target
-          BIN_DIR="$TEMP_INSTALL/usr/bin"
-          mkdir -p "$BIN_DIR"
-          # Find and copy frida-* scripts from the Python scripts directory
-          SCRIPTS_DIR=$(python -c "import sys; print(sys.prefix)/bin")
-          for script in frida frida-*; do
-            if [ -f "$SCRIPTS_DIR/$script" ]; then
-              cp "$SCRIPTS_DIR/$script" "$BIN_DIR/"
-            fi
-          done
-
-          # Make binaries executable
-          chmod +x "$BIN_DIR/"* 2>/dev/null || true
+          # Install frida-tools and its dependencies (which are pure Python, so no platform issues)
+          # We remove --no-deps for this step so that dependencies are installed
+          # But we still need to use --target and platform options
+          pip install --target "$PIP_TARGET" \
+                      --platform android_arm \
+                      --python-version 3.10 \
+                      --implementation cp \
+                      --only-binary :all: \
+                      --find-links ${{ github.workspace }}/wheels \
+                      "$TOOLS_SPEC"
 
           # Verify installation
-          ls -la "$BIN_DIR" || true
-          ls -la "$TEMP_INSTALL/usr/lib/python3.10/site-packages" || true
+          ls -la "$PIP_TARGET" || true
+
+      # ============================================
+      # Generate wrapper scripts for frida commands
+      # ============================================
+
+      - name: Create wrapper scripts for frida-tools
+        run: |
+          TEMP_INSTALL="${{ github.workspace }}/temp_install"
+          BIN_DIR="$TEMP_INSTALL/usr/bin"
+          mkdir -p "$BIN_DIR"
+
+          # List of common frida-tools commands
+          COMMANDS="frida frida-ps frida-trace frida-discover frida-kill frida-ls-devices"
+
+          for cmd in $COMMANDS; do
+            # Create a wrapper script that calls the corresponding module
+            cat > "$BIN_DIR/$cmd" << EOF
+          #!/data/data/com.termux/files/usr/bin/sh
+          exec python3 -m frida_tools.$cmd "\$@"
+          EOF
+            chmod +x "$BIN_DIR/$cmd"
+          done
+
+          # Also ensure that 'frida' is available (it's already covered)
 
       # ============================================
       # Stage files for .deb packaging
@@ -146,10 +171,10 @@ jobs:
           TEMP_INSTALL="${{ github.workspace }}/temp_install"
           STAGING_DIR="${{ github.workspace }}/staging"
 
-          # Create the Termux prefix structure
+          # Create Termux prefix
           mkdir -p "$STAGING_DIR/data/data/com.termux/files/usr"
 
-          # Copy installed Python packages and scripts
+          # Copy the installed Python packages and the bin scripts
           cp -r "$TEMP_INSTALL/usr/lib" "$STAGING_DIR/data/data/com.termux/files/usr/"
           cp -r "$TEMP_INSTALL/usr/bin" "$STAGING_DIR/data/data/com.termux/files/usr/"
 
@@ -174,7 +199,7 @@ jobs:
           Homepage: https://frida.re
           EOF
 
-          # Generate md5sums for all files (excluding DEBIAN)
+          # Generate md5sums
           cd "$STAGING_DIR"
           find . -type f ! -path "./DEBIAN/*" -exec md5sum {} \; > "$DEBIAN_DIR/md5sums"
 
