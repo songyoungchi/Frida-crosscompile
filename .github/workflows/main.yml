@@ -241,7 +241,8 @@ jobs:
           DEB_FILE="$(ls dist/*.deb | head -n1)"
           dpkg-deb --info "$DEB_FILE"
           echo "---- contents (first 40 entries) ----"
-          dpkg-deb --contents "$DEB_FILE" | head -n 40
+          dpkg-deb --contents "$DEB_FILE" > /tmp/deb-contents.txt
+          head -n 40 /tmp/deb-contents.txt
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v5
