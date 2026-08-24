@@ -1,46 +1,3 @@
-# .github/workflows/build-frida-termux-deb.yml
-#
-# Builds a Termux-installable .deb of `frida-tools` targeting Android 8.1
-# (API 27) on 32-bit ARM (armeabi-v7a / armv7).
-#
-# ── Why it's built this way ──────────────────────────────────────────────
-# Termux runs on Android's Bionic libc, not glibc, so a plain Ubuntu+QEMU
-# cross-build would produce binaries that LOOK right but won't run under
-# Termux. Instead this workflow:
-#   1. Registers QEMU so the (x86_64) runner can execute 32-bit ARM code.
-#   2. Runs the official `termux/termux-docker:arm` image, which is a real,
-#      Bionic-based Termux userland emulated as armv7 — i.e. it behaves
-#      like an actual Termux install, not a cross-compiled approximation.
-#   3. Inside that container, runs (almost) the same steps as the
-#      reference install script you'd run by hand on-device: install
-#      python/git/a toolchain, download the frida-core-devkit for
-#      android-arm, build the AbhiTheModder/frida-python bindings against
-#      it, then `pip install frida-tools`.
-#   4. Diffs `pip list` before/after that install to work out exactly
-#      which files were added, and packs those into a single
-#      `frida-tools_<version>_arm.deb` using dpkg-deb — so the result is
-#      one package bundling frida-tools, the frida Python bindings, and
-#      whatever pip pulled in alongside them (colorama, prompt-toolkit,
-#      pygments, websockets, ...).
-#
-# ── Things worth knowing before you rely on this ─────────────────────────
-# - "Android 8.1 / API 27" compatibility is inherited from Termux's own
-#   `arm` package baseline (the same one real devices run), not something
-#   pinned independently in this workflow. If you need a hard guarantee,
-#   test the resulting .deb on a real API 27 device or emulator.
-# - This only works for a Frida version that actually published a
-#   `frida-core-devkit-<version>-android-arm.tar.xz` release asset. If a
-#   future Frida release drops 32-bit Android devkits, the download step
-#   will 404 — check the releases page if that happens:
-#   https://github.com/frida/frida/releases
-# - QEMU-emulated builds are slow. Expect this to take noticeably longer
-#   than a native x86_64 CI job.
-# - Only one image is required for the whole build+package process, and no
-#   extra `--user`/volume permission juggling is needed: the build script
-#   is injected into the container with `docker cp` and the finished .deb
-#   is copied back out the same way, so nothing depends on matching UIDs
-#   between the runner and the emulated Termux user.
-
 name: Build frida-tools .deb for Termux (armv7 / API 27)
 
 on:
@@ -65,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TERMUX_PKG_ARCH: arm                                  # Termux's name for armeabi-v7a/armv7
+  TERMUX_PKG_ARCH: arm
   TERMUX_DOCKER_IMAGE: docker.io/termux/termux-docker:arm
   TERMUX_DOCKER_PLATFORM: linux/arm/v7
   FRIDA_PYTHON_ANDROID_REPO: https://github.com/AbhiTheModder/frida-python
@@ -76,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
-      contents: write   # only used by the release step on tag pushes
+      contents: write
 
     steps:
       - name: Resolve build version
@@ -113,15 +70,6 @@ jobs:
           OUT_DIR="${{ github.workspace }}/dist"
           mkdir -p "$OUT_DIR"
 
-          # Build the in-container script. The first few lines are filled in
-          # here (on the runner) with printf %q so the values are baked into
-          # the file as literal, safely-quoted assignments -- this avoids
-          # relying on `docker create -e ...` env vars, which can get
-          # stripped if the container's entrypoint drops from root to the
-          # unprivileged Termux user via a login shell before running our
-          # command. Everything after that is a single quoted heredoc, so
-          # none of it is touched by this outer shell -- it's only
-          # interpreted later, inside the container.
           SCRIPT="$RUNNER_TEMP/build-in-termux.sh"
           {
             printf '#!/data/data/com.termux/files/usr/bin/bash\n'
@@ -144,17 +92,11 @@ jobs:
           pkg update -y
           pkg upgrade -y
 
-          # The reference install script assumes clang/make/curl are already on the
-          # device from earlier Termux use. This container starts from a bare
-          # bootstrap, so the full toolchain is installed explicitly here.
           echo "==> Installing build dependencies"
           pkg install -y python git clang make binutils curl dpkg
 
           python3 -m pip install --upgrade pip setuptools wheel
 
-          # Snapshot installed pip packages before touching Frida, so the exact set
-          # of files the Frida install adds can be worked out afterwards. That file
-          # list becomes the payload of the .deb.
           BASELINE_PKGS="$(python3 -m pip list --format=freeze | sort)"
 
           DEVKIT_URL="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-core-devkit-${FRIDA_VERSION}-android-${TERMUX_PKG_ARCH}.tar.xz"
@@ -168,8 +110,6 @@ jobs:
 
           ver() { echo "$1" | awk -F. '{ printf("%d%03d%03d", $1, $2, $3) }'; }
 
-          # Mirrors the compatibility rule from the reference script: older Frida
-          # core versions need an older frida-tools release to match their ABI.
           if [ "$(ver "$FRIDA_VERSION")" -le "$(ver "17.0.7")" ]; then
             if [ "$(ver "$FRIDA_VERSION")" -lt "$(ver "17.0.0")" ]; then
               TOOLS_CONSTRAINT="<=13.7.1"
@@ -282,8 +222,8 @@ jobs:
           } > "$SCRIPT"
 
           CID=$(docker create --platform "$TERMUX_DOCKER_PLATFORM" --privileged \
-            "$TERMUX_DOCKER_IMAGE" bash /tmp/build-in-termux.sh)
-          docker cp "$SCRIPT" "$CID:/tmp/build-in-termux.sh"
+            "$TERMUX_DOCKER_IMAGE" bash /data/data/com.termux/files/usr/tmp/build-in-termux.sh)
+          docker cp "$SCRIPT" "$CID:/data/data/com.termux/files/usr/tmp/build-in-termux.sh"
           docker start --attach "$CID"
           STATUS=$(docker inspect --format='{{.State.ExitCode}}' "$CID")
           docker cp "$CID:/data/data/com.termux/files/home/output/." "$OUT_DIR/" 2>/dev/null || true
