@@ -1,5 +1,5 @@
 # .github/workflows/build-frida-termux-deb.yml
-# Builds frida-tools .deb for Termux (Android ARMv7) using QEMU and a virtual environment.
+# Builds frida-tools .deb for Termux (Android ARMv7) using official pre-built wheels.
 
 name: Build Frida Termux DEB
 
@@ -38,7 +38,7 @@ jobs:
             echo "version=${{ inputs.frida_version }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build inside ARMv7 container with venv
+      - name: Build inside ARMv7 container using pre-built wheels
         id: build
         run: |
           FRIDA_VERSION="${{ steps.frida_version.outputs.version }}"
@@ -56,78 +56,66 @@ jobs:
               echo '=== Installing system dependencies ==='
               apt-get update
               apt-get install -y --no-install-recommends \
-                python3 python3-pip python3-venv python3-dev \
-                git curl xz-utils build-essential pkg-config \
-                libssl-dev
+                python3 python3-pip python3-venv \
+                curl git file
 
-              # Create a virtual environment
+              echo '=== Creating virtual environment ==='
               python3 -m venv /venv
               source /venv/bin/activate
+              pip install --upgrade pip
 
-              echo '=== Installing Python build tools ==='
-              pip install --upgrade pip setuptools wheel
+              echo '=== Downloading frida-python wheel for Android ARM ==='
+              # Use cp311 because Debian Bookworm has Python 3.11
+              WHEEL_URL=\"https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-python-${FRIDA_VERSION}-android-arm-cp311.whl\"
+              echo \"Downloading \$WHEEL_URL\"
+              curl -L -o frida-python-android-arm.whl \"\$WHEEL_URL\"
 
-              echo '=== Downloading Frida Core DevKit ==='
-              DEVKIT_URL=\"https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-core-devkit-${FRIDA_VERSION}-android-arm.tar.xz\"
-              curl -L -o frida-core-devkit-android-arm.tar.xz \"\$DEVKIT_URL\"
-              mkdir -p /root/devkit
-              tar -xvf frida-core-devkit-android-arm.tar.xz -C /root/devkit
-              rm -f frida-core-devkit-android-arm.tar.xz
+              echo '=== Installing frida from wheel (no compilation) ==='
+              pip install --no-deps frida-python-android-arm.whl
 
-              echo '=== Setting ABI flags to match devkit (softfp) ==='
-              export CFLAGS=\"-mfloat-abi=softfp -mfpu=vfpv3-d16 -march=armv7-a\"
-              export LDFLAGS=\"-mfloat-abi=softfp\"
-
-              echo '=== Cloning and building frida-python ==='
+              echo '=== Installing frida-tools ==='
               version_ge() {
                 [ \"\$(printf '%s\n' \"\$1\" \"\$2\" | sort -V | head -n1)\" != \"\$1\" ]
               }
 
-              if version_ge \"17.0.7\" \"$FRIDA_VERSION\"; then
-                git clone https://github.com/AbhiTheModder/frida-python frida-python-android -b 17.0.7
-              else
-                git clone https://github.com/AbhiTheModder/frida-python frida-python-android
-              fi
-
-              cd frida-python-android
-              FRIDA_VERSION=\"$FRIDA_VERSION\" FRIDA_CORE_DEVKIT=\"/root/devkit\" pip install --force-reinstall .
-              cd ..
-              rm -rf frida-python-android
-
-              echo '=== Installing frida-tools ==='
               if [ -n \"$FRIDA_TOOLS_VERSION\" ]; then
-                pip install --upgrade frida-tools==\"$FRIDA_TOOLS_VERSION\"
+                pip install frida-tools==\"$FRIDA_TOOLS_VERSION\"
               else
-                if version_ge \"17.0.7\" \"$FRIDA_VERSION\"; then
-                  if version_ge \"17.0.0\" \"$FRIDA_VERSION\"; then
-                    pip install --upgrade 'frida-tools<=14.0.2'
+                if version_ge \"17.0.7\" \"\$FRIDA_VERSION\"; then
+                  if version_ge \"17.0.0\" \"\$FRIDA_VERSION\"; then
+                    pip install 'frida-tools<=14.0.2'
                   else
-                    pip install --upgrade 'frida-tools<=13.7.1'
+                    pip install 'frida-tools<=13.7.1'
                   fi
                 else
-                  pip install --upgrade frida-tools
+                  pip install frida-tools
                 fi
               fi
 
               echo '=== Verifying installation ==='
               python -c 'import frida; print(frida.__version__)'
-              frida --version || true
 
               echo '=== Preparing staging directory ==='
               STAGING_DIR=\"/workspace/staging/data/data/com.termux/files/usr\"
               mkdir -p \"\$STAGING_DIR/lib/python3.11/site-packages\"
               mkdir -p \"\$STAGING_DIR/bin\"
 
-              # Copy site-packages from venv
               VENV_SITE=\$(python -c \"import site; print(site.getsitepackages()[0])\")
+
+              # Copy frida and frida_tools packages
               cp -r \"\$VENV_SITE/frida\" \"\$STAGING_DIR/lib/python3.11/site-packages/\"
               cp -r \"\$VENV_SITE/frida_tools\" \"\$STAGING_DIR/lib/python3.11/site-packages/\"
+              # Copy dependencies (colorama, prompt_toolkit, pygments, etc.)
+              for pkg in colorama prompt_toolkit pygments; do
+                if [ -d \"\$VENV_SITE/\$pkg\" ]; then
+                  cp -r \"\$VENV_SITE/\$pkg\" \"\$STAGING_DIR/lib/python3.11/site-packages/\"
+                fi
+              done
 
               # Copy bin scripts and fix shebang
               for script in /venv/bin/frida*; do
                 [ -f \"\$script\" ] || continue
                 cp \"\$script\" \"\$STAGING_DIR/bin/\"
-                # Replace shebang with Termux Python path
                 sed -i '1s|^#!/.*python.*|#!/data/data/com.termux/files/usr/bin/python3|' \"\$STAGING_DIR/bin/\$(basename \"\$script\")\"
               done
               chmod +x \"\$STAGING_DIR/bin/\"*
@@ -166,7 +154,7 @@ jobs:
 
           cd "${{ github.workspace }}"
           dpkg-deb --build "$STAGING_DIR" "${PKG_NAME}_${FRIDA_VERSION}_${PKG_ARCH}.deb"
-          file "${PKG_NAME}_${FRIDA_VERSION}_${PKG_ARCH}.deb"
+          file "${PKG_NAME}_${FRIDA_VERSION}_${PKG_ARM}.deb"
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
