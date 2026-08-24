@@ -1,5 +1,5 @@
 # .github/workflows/build-frida-termux-deb.yml
-# Builds frida-tools .deb for Termux (Android ARMv7) using official pre-built wheels.
+# Builds frida-tools .deb for Termux (Android ARMv7) using official pre-built wheel for Python 3.10.
 
 name: Build Frida Termux DEB
 
@@ -38,7 +38,7 @@ jobs:
             echo "version=${{ inputs.frida_version }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build inside ARMv7 container using pre-built wheels
+      - name: Build inside ARMv7 container using Python 3.10 and pre-built wheel
         id: build
         run: |
           FRIDA_VERSION="${{ steps.frida_version.outputs.version }}"
@@ -53,22 +53,31 @@ jobs:
               set -e
               export DEBIAN_FRONTEND=noninteractive
 
-              echo '=== Installing system dependencies ==='
+              echo '=== Installing Python 3.10 and dependencies ==='
               apt-get update
               apt-get install -y --no-install-recommends \
-                python3 python3-pip python3-venv \
-                curl git file
+                python3.10 python3.10-venv python3.10-dev \
+                curl git file build-essential
 
-              echo '=== Creating virtual environment ==='
-              python3 -m venv /venv
+              # Create a virtual environment using Python 3.10
+              python3.10 -m venv /venv
               source /venv/bin/activate
               pip install --upgrade pip
 
-              echo '=== Downloading frida-python wheel for Android ARM ==='
-              # Use cp311 because Debian Bookworm has Python 3.11
-              WHEEL_URL=\"https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-python-${FRIDA_VERSION}-android-arm-cp311.whl\"
+              echo '=== Downloading frida-python wheel for Android ARM (cp310) ==='
+              WHEEL_URL=\"https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-python-${FRIDA_VERSION}-android-arm-cp310.whl\"
               echo \"Downloading \$WHEEL_URL\"
               curl -L -o frida-python-android-arm.whl \"\$WHEEL_URL\"
+              # Check if file is valid (should be > 100 bytes)
+              if [ \$(stat -c%s frida-python-android-arm.whl) -lt 100 ]; then
+                echo \"Wheel file seems invalid (possibly 404). Trying cp39...\"
+                WHEEL_URL=\"https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-python-${FRIDA_VERSION}-android-arm-cp39.whl\"
+                curl -L -o frida-python-android-arm.whl \"\$WHEEL_URL\"
+              fi
+              if [ \$(stat -c%s frida-python-android-arm.whl) -lt 100 ]; then
+                echo \"ERROR: No suitable wheel found.\"
+                exit 1
+              fi
 
               echo '=== Installing frida from wheel (no compilation) ==='
               pip install --no-deps frida-python-android-arm.whl
@@ -97,22 +106,21 @@ jobs:
 
               echo '=== Preparing staging directory ==='
               STAGING_DIR=\"/workspace/staging/data/data/com.termux/files/usr\"
-              mkdir -p \"\$STAGING_DIR/lib/python3.11/site-packages\"
+              mkdir -p \"\$STAGING_DIR/lib/python3.10/site-packages\"
               mkdir -p \"\$STAGING_DIR/bin\"
 
               VENV_SITE=\$(python -c \"import site; print(site.getsitepackages()[0])\")
 
-              # Copy frida and frida_tools packages
-              cp -r \"\$VENV_SITE/frida\" \"\$STAGING_DIR/lib/python3.11/site-packages/\"
-              cp -r \"\$VENV_SITE/frida_tools\" \"\$STAGING_DIR/lib/python3.11/site-packages/\"
-              # Copy dependencies (colorama, prompt_toolkit, pygments, etc.)
+              # Copy packages
+              cp -r \"\$VENV_SITE/frida\" \"\$STAGING_DIR/lib/python3.10/site-packages/\"
+              cp -r \"\$VENV_SITE/frida_tools\" \"\$STAGING_DIR/lib/python3.10/site-packages/\"
               for pkg in colorama prompt_toolkit pygments; do
                 if [ -d \"\$VENV_SITE/\$pkg\" ]; then
-                  cp -r \"\$VENV_SITE/\$pkg\" \"\$STAGING_DIR/lib/python3.11/site-packages/\"
+                  cp -r \"\$VENV_SITE/\$pkg\" \"\$STAGING_DIR/lib/python3.10/site-packages/\"
                 fi
               done
 
-              # Copy bin scripts and fix shebang
+              # Copy and fix shebang for scripts
               for script in /venv/bin/frida*; do
                 [ -f \"\$script\" ] || continue
                 cp \"\$script\" \"\$STAGING_DIR/bin/\"
@@ -154,7 +162,7 @@ jobs:
 
           cd "${{ github.workspace }}"
           dpkg-deb --build "$STAGING_DIR" "${PKG_NAME}_${FRIDA_VERSION}_${PKG_ARCH}.deb"
-          file "${PKG_NAME}_${FRIDA_VERSION}_${PKG_ARM}.deb"
+          file "${PKG_NAME}_${FRIDA_VERSION}_${PKG_ARCH}.deb"
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
