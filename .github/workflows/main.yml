@@ -25,6 +25,7 @@ env:
   TERMUX_PKG_ARCH: arm
   TERMUX_DOCKER_IMAGE: docker.io/termux/termux-docker:arm
   TERMUX_DOCKER_PLATFORM: linux/arm/v7
+  FRIDA_PYTHON_ANDROID_REPO: https://github.com/AbhiTheModder/frida-python
 
 jobs:
   build:
@@ -77,6 +78,7 @@ jobs:
             printf 'FRIDA_TOOLS_VERSION=%q\n' "$FRIDA_TOOLS_VERSION"
             printf 'TERMUX_PKG_ARCH=%q\n' "$TERMUX_PKG_ARCH"
             printf 'MAINTAINER=%q\n' "$MAINTAINER"
+            printf 'FRIDA_PYTHON_ANDROID_REPO=%q\n' "$FRIDA_PYTHON_ANDROID_REPO"
             cat <<'BUILD_SCRIPT_EOF'
 
           echo "==> Building frida-tools against Frida ${FRIDA_VERSION} (android-${TERMUX_PKG_ARCH})"
@@ -91,7 +93,7 @@ jobs:
           pkg upgrade -y
 
           echo "==> Installing build dependencies"
-          pkg install -y python git clang make binutils curl dpkg which
+          pkg install -y python git clang make binutils curl dpkg
 
           python3 -m pip install --upgrade pip setuptools wheel
 
@@ -106,15 +108,6 @@ jobs:
           tar -xf "frida-core-devkit-android-${TERMUX_PKG_ARCH}.tar.xz" -C "$HOME/devkit"
           rm -f "frida-core-devkit-android-${TERMUX_PKG_ARCH}.tar.xz"
 
-          echo "==> Locating devkit directory"
-          DEVKIT_DIR="$(find "$HOME/devkit" -name frida-core.h -printf '%h\n' | head -n1 | xargs dirname)"
-          if [ -z "$DEVKIT_DIR" ]; then
-            echo "::error::Could not locate frida-core.h in devkit"
-            exit 1
-          fi
-          echo "Devkit directory: ${DEVKIT_DIR}"
-          export FRIDA_CORE_DEVKIT="$DEVKIT_DIR"
-
           ver() { echo "$1" | awk -F. '{ printf("%d%03d%03d", $1, $2, $3) }'; }
 
           if [ "$(ver "$FRIDA_VERSION")" -le "$(ver "17.0.7")" ]; then
@@ -123,12 +116,24 @@ jobs:
             else
               TOOLS_CONSTRAINT="<=14.0.2"
             fi
+            FRIDA_PYTHON_REF="17.0.7"
           else
             TOOLS_CONSTRAINT=">14.0.2"
+            FRIDA_PYTHON_REF=""
           fi
 
-          echo "==> Installing frida Python bindings (version ${FRIDA_VERSION})"
-          python3 -m pip install --no-build-isolation --force-reinstall "frida==${FRIDA_VERSION}"
+          if [ -n "$FRIDA_PYTHON_REF" ]; then
+            git clone --branch "$FRIDA_PYTHON_REF" --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
+          else
+            git clone --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
+          fi
+
+          (
+            cd frida-python-android
+            FRIDA_VERSION="$FRIDA_VERSION" FRIDA_CORE_DEVKIT="$HOME/devkit" \
+              python3 -m pip install --force-reinstall .
+          )
+          rm -rf "$HOME/frida-python-android"
 
           if [ -n "$FRIDA_TOOLS_VERSION" ]; then
             python3 -m pip install --upgrade "frida-tools==${FRIDA_TOOLS_VERSION}"
