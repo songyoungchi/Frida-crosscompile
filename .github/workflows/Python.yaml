@@ -1,0 +1,155 @@
+name: Build Python .deb for Termux (armv7 / API 27)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERMUX_PKG_ARCH: arm
+  TERMUX_DOCKER_IMAGE: docker.io/termux/termux-docker:arm
+  TERMUX_DOCKER_PLATFORM: linux/arm/v7
+
+jobs:
+  build:
+    name: Build Python .deb (Termux arm / API 27)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+
+    steps:
+      - name: Set up QEMU (arm emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Pull Termux arm build image
+        run: docker pull --platform "$TERMUX_DOCKER_PLATFORM" "$TERMUX_DOCKER_IMAGE"
+
+      - name: Build Python .deb inside emulated Termux
+        env:
+          MAINTAINER: ${{ github.repository_owner }} <${{ github.repository_owner }}@users.noreply.github.com>
+        run: |
+          set -euo pipefail
+          OUT_DIR="${{ github.workspace }}/dist"
+          mkdir -p "$OUT_DIR"
+
+          SCRIPT="$RUNNER_TEMP/build-in-termux.sh"
+          {
+            printf '#!/data/data/com.termux/files/usr/bin/bash\n'
+            printf 'set -euo pipefail\n'
+            printf 'TERMUX_PKG_ARCH=%q\n' "$TERMUX_PKG_ARCH"
+            printf 'MAINTAINER=%q\n' "$MAINTAINER"
+            cat <<'BUILD_SCRIPT_EOF'
+
+          echo "==> Setting up Termux environment"
+          export HOME=/data/data/com.termux/files/home
+          export PREFIX=/data/data/com.termux/files/usr
+          export PATH="$PREFIX/bin:$PATH"
+          cd "$HOME"
+
+          echo "==> Updating package lists and upgrading base"
+          pkg update -y
+          pkg upgrade -y
+
+          echo "==> Snapshot files before installing Python"
+          find "$PREFIX" -type f -o -type l | sort > "$HOME/before-files.txt"
+
+          echo "==> Installing Python and pip"
+          pkg install -y python python-pip
+
+          echo "==> Snapshot files after installation"
+          find "$PREFIX" -type f -o -type l | sort > "$HOME/after-files.txt"
+
+          echo "==> Computing new files"
+          comm -13 "$HOME/before-files.txt" "$HOME/after-files.txt" > "$HOME/new-files.txt"
+
+          if [ ! -s "$HOME/new-files.txt" ]; then
+            echo "No new files detected - nothing to package." >&2
+            exit 1
+          fi
+          echo "Number of new files: $(wc -l < "$HOME/new-files.txt")"
+
+          PY_VERSION="$(python3 --version | awk '{print $2}')"
+          echo "==> Python version: ${PY_VERSION}"
+
+          STAGE="$HOME/pkgroot"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/DEBIAN"
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            if [ -f "$file" ] || [ -L "$file" ]; then
+              dst="$STAGE$file"
+              mkdir -p "$(dirname "$dst")"
+              cp -P "$file" "$dst"
+            fi
+          done < "$HOME/new-files.txt"
+
+          DEB_NAME="python-termux_${PY_VERSION}_${TERMUX_PKG_ARCH}.deb"
+          SIZE_KB="$(du -sk "$STAGE" | cut -f1)"
+
+          cat > "$STAGE/DEBIAN/control" << CONTROL_EOF
+          Package: python-termux
+          Version: ${PY_VERSION}
+          Architecture: ${TERMUX_PKG_ARCH}
+          Maintainer: ${MAINTAINER}
+          Installed-Size: ${SIZE_KB}
+          Depends: libc++
+          Provides: python, python-pip
+          Homepage: https://www.python.org
+          Description: Python and pip for Termux (armv7, API 27+)
+           Bundled from official Termux packages, packaged as a standalone .deb.
+          CONTROL_EOF
+
+          mkdir -p "$HOME/output"
+          dpkg-deb --root-owner-group --build "$STAGE" "$HOME/output/${DEB_NAME}"
+
+          echo "==> Built package:"
+          ls -lh "$HOME/output"
+          dpkg-deb --info "$HOME/output/${DEB_NAME}"
+          BUILD_SCRIPT_EOF
+          } > "$SCRIPT"
+
+          CID=$(docker create --platform "$TERMUX_DOCKER_PLATFORM" --privileged \
+            "$TERMUX_DOCKER_IMAGE" bash /data/data/com.termux/files/usr/tmp/build-in-termux.sh)
+          docker cp "$SCRIPT" "$CID:/data/data/com.termux/files/usr/tmp/build-in-termux.sh"
+          docker start --attach "$CID"
+          STATUS=$(docker inspect --format='{{.State.ExitCode}}' "$CID")
+          docker cp "$CID:/data/data/com.termux/files/home/output/." "$OUT_DIR/" 2>/dev/null || true
+          docker rm -f "$CID" > /dev/null || true
+
+          if [ "$STATUS" != "0" ]; then
+            echo "::error::Termux build container exited with status ${STATUS}"
+            exit 1
+          fi
+
+      - name: Verify package
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          DEB_FILE="$(ls dist/*.deb | head -n1)"
+          dpkg-deb --info "$DEB_FILE"
+          echo "---- contents (first 40 entries) ----"
+          dpkg-deb --contents "$DEB_FILE" > /tmp/deb-contents.txt
+          head -n 40 /tmp/deb-contents.txt
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: python-termux-arm
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          generate_release_notes: true
