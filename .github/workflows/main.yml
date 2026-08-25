@@ -91,7 +91,7 @@ jobs:
           pkg upgrade -y
 
           echo "==> Installing build dependencies"
-          pkg install -y python git clang make binutils curl dpkg
+          pkg install -y python git clang make binutils curl dpkg which
 
           python3 -m pip install --upgrade pip setuptools wheel
 
@@ -120,7 +120,7 @@ jobs:
 
           echo "==> Installing frida Python bindings (version ${FRIDA_VERSION})"
           FRIDA_CORE_DEVKIT="$HOME/devkit" \
-            python3 -m pip install --force-reinstall "frida==${FRIDA_VERSION}"
+            python3 -m pip install --no-build-isolation --force-reinstall "frida==${FRIDA_VERSION}"
 
           if [ -n "$FRIDA_TOOLS_VERSION" ]; then
             python3 -m pip install --upgrade "frida-tools==${FRIDA_TOOLS_VERSION}"
