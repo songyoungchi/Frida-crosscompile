@@ -120,7 +120,7 @@ jobs:
             TOOLS_CONSTRAINT=">14.0.2"
           fi
 
-          git clone --branch 17.0.7 --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
+          git clone --branch "${FRIDA_VERSION}" --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
 
           (
             cd frida-python-android
