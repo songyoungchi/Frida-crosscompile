@@ -106,6 +106,15 @@ jobs:
           tar -xf "frida-core-devkit-android-${TERMUX_PKG_ARCH}.tar.xz" -C "$HOME/devkit"
           rm -f "frida-core-devkit-android-${TERMUX_PKG_ARCH}.tar.xz"
 
+          echo "==> Locating devkit directory"
+          DEVKIT_DIR="$(find "$HOME/devkit" -name frida-core.h -printf '%h\n' | head -n1 | xargs dirname)"
+          if [ -z "$DEVKIT_DIR" ]; then
+            echo "::error::Could not locate frida-core.h in devkit"
+            exit 1
+          fi
+          echo "Devkit directory: ${DEVKIT_DIR}"
+          export FRIDA_CORE_DEVKIT="$DEVKIT_DIR"
+
           ver() { echo "$1" | awk -F. '{ printf("%d%03d%03d", $1, $2, $3) }'; }
 
           if [ "$(ver "$FRIDA_VERSION")" -le "$(ver "17.0.7")" ]; then
@@ -119,8 +128,7 @@ jobs:
           fi
 
           echo "==> Installing frida Python bindings (version ${FRIDA_VERSION})"
-          FRIDA_CORE_DEVKIT="$HOME/devkit" \
-            python3 -m pip install --no-build-isolation --force-reinstall "frida==${FRIDA_VERSION}"
+          python3 -m pip install --no-build-isolation --force-reinstall "frida==${FRIDA_VERSION}"
 
           if [ -n "$FRIDA_TOOLS_VERSION" ]; then
             python3 -m pip install --upgrade "frida-tools==${FRIDA_TOOLS_VERSION}"
