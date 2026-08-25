@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: ""
+      frida_python_ref:
+        description: "Optional branch or commit of AbhiTheModder/frida-python to use. Leave blank for default behavior (branch 17.0.7 for Frida <=17.0.7, main for >17.0.7)."
+        required: false
+        type: string
+        default: ""
   push:
     tags:
       - "v*.*.*"
@@ -50,6 +55,7 @@ jobs:
           fi
           echo "frida_version=${FRIDA_VERSION}" >> "$GITHUB_OUTPUT"
           echo "frida_tools_version=${{ github.event.inputs.frida_tools_version }}" >> "$GITHUB_OUTPUT"
+          echo "frida_python_ref=${{ github.event.inputs.frida_python_ref }}" >> "$GITHUB_OUTPUT"
           echo "Building frida-tools against Frida ${FRIDA_VERSION}"
 
       - name: Set up QEMU (arm emulation)
@@ -64,6 +70,7 @@ jobs:
         env:
           FRIDA_VERSION: ${{ steps.version.outputs.frida_version }}
           FRIDA_TOOLS_VERSION: ${{ steps.version.outputs.frida_tools_version }}
+          FRIDA_PYTHON_REF: ${{ steps.version.outputs.frida_python_ref }}
           MAINTAINER: ${{ github.repository_owner }} <${{ github.repository_owner }}@users.noreply.github.com>
         run: |
           set -euo pipefail
@@ -76,6 +83,7 @@ jobs:
             printf 'set -euo pipefail\n'
             printf 'FRIDA_VERSION=%q\n' "$FRIDA_VERSION"
             printf 'FRIDA_TOOLS_VERSION=%q\n' "$FRIDA_TOOLS_VERSION"
+            printf 'FRIDA_PYTHON_REF=%q\n' "$FRIDA_PYTHON_REF"
             printf 'TERMUX_PKG_ARCH=%q\n' "$TERMUX_PKG_ARCH"
             printf 'MAINTAINER=%q\n' "$MAINTAINER"
             printf 'FRIDA_PYTHON_ANDROID_REPO=%q\n' "$FRIDA_PYTHON_ANDROID_REPO"
@@ -93,7 +101,7 @@ jobs:
           pkg upgrade -y
 
           echo "==> Installing build dependencies"
-          pkg install -y python git clang make binutils curl dpkg
+          pkg install -y python git clang make binutils curl dpkg which
 
           python3 -m pip install --upgrade pip setuptools wheel
 
@@ -108,6 +116,15 @@ jobs:
           tar -xf "frida-core-devkit-android-${TERMUX_PKG_ARCH}.tar.xz" -C "$HOME/devkit"
           rm -f "frida-core-devkit-android-${TERMUX_PKG_ARCH}.tar.xz"
 
+          echo "==> Locating devkit directory"
+          DEVKIT_DIR="$(find "$HOME/devkit" -name frida-core.h -printf '%h\n' | head -n1 | xargs dirname)"
+          if [ -z "$DEVKIT_DIR" ]; then
+            echo "::error::Could not locate frida-core.h in devkit"
+            exit 1
+          fi
+          echo "Devkit directory: ${DEVKIT_DIR}"
+          export FRIDA_CORE_DEVKIT="$DEVKIT_DIR"
+
           ver() { echo "$1" | awk -F. '{ printf("%d%03d%03d", $1, $2, $3) }'; }
 
           if [ "$(ver "$FRIDA_VERSION")" -le "$(ver "17.0.7")" ]; then
@@ -116,17 +133,15 @@ jobs:
             else
               TOOLS_CONSTRAINT="<=14.0.2"
             fi
-            FRIDA_PYTHON_REF="17.0.7"
+            DEFAULT_REF="17.0.7"
           else
             TOOLS_CONSTRAINT=">14.0.2"
-            FRIDA_PYTHON_REF=""
+            DEFAULT_REF="main"
           fi
 
-          if [ -n "$FRIDA_PYTHON_REF" ]; then
-            git clone --branch "$FRIDA_PYTHON_REF" --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
-          else
-            git clone --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
-          fi
+          FRIDA_PYTHON_CLONE_REF="${FRIDA_PYTHON_REF:-$DEFAULT_REF}"
+          echo "==> Cloning frida-python using ref: ${FRIDA_PYTHON_CLONE_REF}"
+          git clone --branch "$FRIDA_PYTHON_CLONE_REF" --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
 
           (
             cd frida-python-android
