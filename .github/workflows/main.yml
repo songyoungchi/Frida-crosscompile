@@ -117,7 +117,7 @@ jobs:
           rm -f "frida-core-devkit-android-${TERMUX_PKG_ARCH}.tar.xz"
 
           echo "==> Locating devkit directory"
-          DEVKIT_DIR="$(find "$HOME/devkit" -name frida-core.h -printf '%h\n' | head -n1 | xargs dirname)"
+          DEVKIT_DIR="$(find "$HOME/devkit" -name frida-core.h -printf '%h\n' -quit)"
           if [ -z "$DEVKIT_DIR" ]; then
             echo "::error::Could not locate frida-core.h in devkit"
             exit 1
