@@ -25,7 +25,6 @@ env:
   TERMUX_PKG_ARCH: arm
   TERMUX_DOCKER_IMAGE: docker.io/termux/termux-docker:arm
   TERMUX_DOCKER_PLATFORM: linux/arm/v7
-  FRIDA_PYTHON_ANDROID_REPO: https://github.com/AbhiTheModder/frida-python
 
 jobs:
   build:
@@ -78,7 +77,6 @@ jobs:
             printf 'FRIDA_TOOLS_VERSION=%q\n' "$FRIDA_TOOLS_VERSION"
             printf 'TERMUX_PKG_ARCH=%q\n' "$TERMUX_PKG_ARCH"
             printf 'MAINTAINER=%q\n' "$MAINTAINER"
-            printf 'FRIDA_PYTHON_ANDROID_REPO=%q\n' "$FRIDA_PYTHON_ANDROID_REPO"
             cat <<'BUILD_SCRIPT_EOF'
 
           echo "==> Building frida-tools against Frida ${FRIDA_VERSION} (android-${TERMUX_PKG_ARCH})"
@@ -120,14 +118,9 @@ jobs:
             TOOLS_CONSTRAINT=">14.0.2"
           fi
 
-          git clone --branch "${FRIDA_VERSION}" --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
-
-          (
-            cd frida-python-android
-            FRIDA_VERSION="$FRIDA_VERSION" FRIDA_CORE_DEVKIT="$HOME/devkit" \
-              python3 -m pip install --force-reinstall .
-          )
-          rm -rf "$HOME/frida-python-android"
+          echo "==> Installing frida Python bindings (version ${FRIDA_VERSION})"
+          FRIDA_CORE_DEVKIT="$HOME/devkit" \
+            python3 -m pip install --force-reinstall "frida==${FRIDA_VERSION}"
 
           if [ -n "$FRIDA_TOOLS_VERSION" ]; then
             python3 -m pip install --upgrade "frida-tools==${FRIDA_TOOLS_VERSION}"
