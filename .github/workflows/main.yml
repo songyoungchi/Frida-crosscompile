@@ -131,6 +131,16 @@ jobs:
 
           ver() { echo "$1" | awk -F. '{ printf("%d%03d%03d", $1, $2, $3) }'; }
 
+          if [ "$(ver "$FRIDA_VERSION")" -le "$(ver "17.0.7")" ]; then
+            if [ "$(ver "$FRIDA_VERSION")" -lt "$(ver "17.0.0")" ]; then
+              TOOLS_CONSTRAINT="<=13.7.1"
+            else
+              TOOLS_CONSTRAINT="<=14.0.2"
+            fi
+          else
+            TOOLS_CONSTRAINT=">14.0.2"
+          fi
+
           if [ -n "$FRIDA_PYTHON_REF" ]; then
             echo "==> Cloning frida-python using explicit ref: ${FRIDA_PYTHON_REF}"
             git clone --branch "$FRIDA_PYTHON_REF" --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
