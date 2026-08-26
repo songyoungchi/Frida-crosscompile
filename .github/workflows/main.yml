@@ -174,10 +174,14 @@ jobs:
           )
           rm -rf "$HOME/frida-python-android"
 
+          echo "==> Creating constraint file to keep frida version ${FRIDA_VERSION}"
+          CONSTRAINTS_FILE="$HOME/frida-constraints.txt"
+          echo "frida==${FRIDA_VERSION}" > "$CONSTRAINTS_FILE"
+
           if [ -n "$FRIDA_TOOLS_VERSION" ]; then
-            python3 -m pip install "frida-tools==${FRIDA_TOOLS_VERSION}"
+            python3 -m pip install "frida-tools==${FRIDA_TOOLS_VERSION}" -c "$CONSTRAINTS_FILE"
           else
-            python3 -m pip install "frida-tools${TOOLS_CONSTRAINT}"
+            python3 -m pip install "frida-tools${TOOLS_CONSTRAINT}" -c "$CONSTRAINTS_FILE"
           fi
 
           PKG_VERSION="$(python3 -m pip show frida-tools | awk -F': ' '/^Version/{print $2}')"
