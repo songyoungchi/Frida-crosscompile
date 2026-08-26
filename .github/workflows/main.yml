@@ -14,7 +14,7 @@ on:
         type: string
         default: ""
       frida_python_ref:
-        description: "Optional branch or commit of AbhiTheModder/frida-python to use. Leave blank for default behavior (branch 17.0.7 for Frida <=17.0.7, main for >17.0.7)."
+        description: "Optional branch or commit of AbhiTheModder/frida-python to use. Leave blank for automatic selection."
         required: false
         type: string
         default: ""
@@ -127,21 +127,31 @@ jobs:
 
           ver() { echo "$1" | awk -F. '{ printf("%d%03d%03d", $1, $2, $3) }'; }
 
-          if [ "$(ver "$FRIDA_VERSION")" -le "$(ver "17.0.7")" ]; then
-            if [ "$(ver "$FRIDA_VERSION")" -lt "$(ver "17.0.0")" ]; then
-              TOOLS_CONSTRAINT="<=13.7.1"
-            else
-              TOOLS_CONSTRAINT="<=14.0.2"
-            fi
-            DEFAULT_REF="17.0.7"
+          if [ -n "$FRIDA_PYTHON_REF" ]; then
+            echo "==> Cloning frida-python using explicit ref: ${FRIDA_PYTHON_REF}"
+            git clone --branch "$FRIDA_PYTHON_REF" --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
           else
-            TOOLS_CONSTRAINT=">14.0.2"
-            DEFAULT_REF="main"
+            if [ "$(ver "$FRIDA_VERSION")" -le "$(ver "17.0.7")" ]; then
+              echo "==> Cloning frida-python using branch 17.0.7"
+              git clone --branch 17.0.7 --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
+            elif [ "$(ver "$FRIDA_VERSION")" -lt "$(ver "17.10.0")" ]; then
+              echo "==> Frida version < 17.10.0; searching for compatible commit before 2026-05-30"
+              git clone --single-branch --branch main --filter=blob:none --no-checkout "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android-src
+              cd frida-python-android-src
+              COMMIT=$(git rev-list -1 --before="2026-05-30 23:59:59" main)
+              if [ -z "$COMMIT" ]; then
+                echo "::error::Could not find suitable commit before 2026-05-30"
+                exit 1
+              fi
+              echo "Selected commit: ${COMMIT}"
+              git checkout "$COMMIT"
+              cd ..
+              mv frida-python-android-src frida-python-android
+            else
+              echo "==> Cloning frida-python using main"
+              git clone --branch main --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
+            fi
           fi
-
-          FRIDA_PYTHON_CLONE_REF="${FRIDA_PYTHON_REF:-$DEFAULT_REF}"
-          echo "==> Cloning frida-python using ref: ${FRIDA_PYTHON_CLONE_REF}"
-          git clone --branch "$FRIDA_PYTHON_CLONE_REF" --depth 1 "$FRIDA_PYTHON_ANDROID_REPO" frida-python-android
 
           (
             cd frida-python-android
