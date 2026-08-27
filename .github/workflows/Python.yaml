@@ -96,8 +96,11 @@ jobs:
           while IFS= read -r pkg; do
             [ -z "$pkg" ] && continue
             echo "  - $pkg"
-            dpkg-query -L "$pkg" > "$HOME/files_${pkg}.txt"
-            tar -C / -cf - --files-from="$HOME/files_${pkg}.txt" | tar -C "$STAGE" -xf -
+            # Get list of files, keep only those inside Termux prefix
+            dpkg-query -L "$pkg" | grep '^/data/data/com.termux/files/usr/' > "$HOME/files_${pkg}.txt" || true
+            if [ -s "$HOME/files_${pkg}.txt" ]; then
+              tar -C / -cf - --files-from="$HOME/files_${pkg}.txt" | tar -C "$STAGE" -xf -
+            fi
           done <<< "$NEW_PACKAGES"
 
           PY_VERSION="$(python3 --version | awk '{print $2}')"
