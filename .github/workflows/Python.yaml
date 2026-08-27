@@ -1,7 +1,13 @@
-name: Build Python .deb for Termux (armv7 / API 27)
+name: Build Python .deb for Termux (armv7)
 
 on:
   workflow_dispatch:
+    inputs:
+      extra_packages:
+        description: "Optional space-separated list of additional Termux packages to bundle (e.g. python-numpy)"
+        required: false
+        type: string
+        default: ""
   push:
     tags:
       - "v*.*.*"
@@ -17,9 +23,9 @@ env:
 
 jobs:
   build:
-    name: Build Python .deb (Termux arm / API 27)
+    name: Build Python bundle (Termux arm)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: write
 
@@ -32,65 +38,75 @@ jobs:
       - name: Pull Termux arm build image
         run: docker pull --platform "$TERMUX_DOCKER_PLATFORM" "$TERMUX_DOCKER_IMAGE"
 
-      - name: Build Python .deb inside emulated Termux
+      - name: Build Python .deb inside Termux
         env:
+          EXTRA_PACKAGES: ${{ github.event.inputs.extra_packages }}
           MAINTAINER: ${{ github.repository_owner }} <${{ github.repository_owner }}@users.noreply.github.com>
         run: |
           set -euo pipefail
           OUT_DIR="${{ github.workspace }}/dist"
           mkdir -p "$OUT_DIR"
 
-          SCRIPT="$RUNNER_TEMP/build-in-termux.sh"
+          SCRIPT="$RUNNER_TEMP/build-python-deb.sh"
           {
             printf '#!/data/data/com.termux/files/usr/bin/bash\n'
             printf 'set -euo pipefail\n'
+            printf 'EXTRA_PACKAGES=%q\n' "$EXTRA_PACKAGES"
             printf 'TERMUX_PKG_ARCH=%q\n' "$TERMUX_PKG_ARCH"
             printf 'MAINTAINER=%q\n' "$MAINTAINER"
             cat <<'BUILD_SCRIPT_EOF'
 
-          echo "==> Setting up Termux environment"
+          echo "==> Building Python bundle for Termux (android-${TERMUX_PKG_ARCH})"
+
           export HOME=/data/data/com.termux/files/home
           export PREFIX=/data/data/com.termux/files/usr
           export PATH="$PREFIX/bin:$PATH"
           cd "$HOME"
 
-          echo "==> Updating package lists and upgrading base"
+          echo "==> Setting Termux mirror to official packages.termux.dev"
+          echo "deb https://packages.termux.dev/apt/termux-main stable main" > "$PREFIX/etc/apt/sources.list"
+          rm -f "$PREFIX/etc/apt/sources.list.d/"*.list 2>/dev/null || true
+
+          echo "==> Updating Termux package lists"
           pkg update -y
           pkg upgrade -y
 
-          echo "==> Snapshot files before installing Python"
-          find "$PREFIX" -type f -o -type l | sort > "$HOME/before-files.txt"
+          echo "==> Snapshotting installed packages before"
+          dpkg-query -W -f='${Package}\n' | sort > /tmp/before_packages.txt
 
-          echo "==> Installing Python and pip"
-          pkg install -y python python-pip
+          echo "==> Installing python and python-pip"
+          pkg install -y python python-pip $EXTRA_PACKAGES
 
-          echo "==> Snapshot files after installation"
-          find "$PREFIX" -type f -o -type l | sort > "$HOME/after-files.txt"
+          echo "==> Snapshotting installed packages after"
+          dpkg-query -W -f='${Package}\n' | sort > /tmp/after_packages.txt
 
-          echo "==> Computing new files"
-          comm -13 "$HOME/before-files.txt" "$HOME/after-files.txt" > "$HOME/new-files.txt"
-
-          if [ ! -s "$HOME/new-files.txt" ]; then
-            echo "No new files detected - nothing to package." >&2
+          NEW_PACKAGES="$(comm -13 /tmp/before_packages.txt /tmp/after_packages.txt)"
+          if [ -z "$NEW_PACKAGES" ]; then
+            echo "No new packages were installed - nothing to package." >&2
             exit 1
           fi
-          echo "Number of new files: $(wc -l < "$HOME/new-files.txt")"
+          echo "Packages to bundle:"
+          echo "$NEW_PACKAGES"
 
-          PY_VERSION="$(python3 --version | awk '{print $2}')"
-          echo "==> Python version: ${PY_VERSION}"
-
-          STAGE="$HOME/pkgroot"
+          STAGE="$HOME/python-pkgroot"
           rm -rf "$STAGE"
           mkdir -p "$STAGE/DEBIAN"
 
-          while IFS= read -r file; do
-            [ -z "$file" ] && continue
-            if [ -f "$file" ] || [ -L "$file" ]; then
-              dst="$STAGE$file"
-              mkdir -p "$(dirname "$dst")"
-              cp -P "$file" "$dst"
-            fi
-          done < "$HOME/new-files.txt"
+          echo "==> Copying files from new packages"
+          while IFS= read -r pkg; do
+            [ -z "$pkg" ] && continue
+            echo "  - $pkg"
+            dpkg-query -L "$pkg" > "/tmp/files_${pkg}.txt"
+            # Copy all files/dirs/symlinks preserving structure from root to stage
+            tar -C / -cf - --files-from="/tmp/files_${pkg}.txt" | tar -C "$STAGE" -xf -
+          done <<< "$NEW_PACKAGES"
+
+          # Remove any possible /data/data/com.termux prefix duplication (shouldn't happen)
+          # The stage contains the prefix path already, we need only the content under /data/data/com.termux/files/usr etc.
+
+          # Get Python version for package version
+          PY_VERSION="$(python3 --version | awk '{print $2}')"
+          echo "Python version detected: ${PY_VERSION}"
 
           DEB_NAME="python-termux_${PY_VERSION}_${TERMUX_PKG_ARCH}.deb"
           SIZE_KB="$(du -sk "$STAGE" | cut -f1)"
@@ -101,11 +117,12 @@ jobs:
           Architecture: ${TERMUX_PKG_ARCH}
           Maintainer: ${MAINTAINER}
           Installed-Size: ${SIZE_KB}
-          Depends: libc++
-          Provides: python, python-pip
+          Depends: 
           Homepage: https://www.python.org
-          Description: Python and pip for Termux (armv7, API 27+)
-           Bundled from official Termux packages, packaged as a standalone .deb.
+          Description: Python interpreter and pip bundled for Termux (armv7)
+           This package bundles python, python-pip, and their dependencies
+           as installed from the official Termux repositories.
+           Install with: dpkg -i python-termux_<version>_arm.deb
           CONTROL_EOF
 
           mkdir -p "$HOME/output"
@@ -118,8 +135,8 @@ jobs:
           } > "$SCRIPT"
 
           CID=$(docker create --platform "$TERMUX_DOCKER_PLATFORM" --privileged \
-            "$TERMUX_DOCKER_IMAGE" bash /data/data/com.termux/files/usr/tmp/build-in-termux.sh)
-          docker cp "$SCRIPT" "$CID:/data/data/com.termux/files/usr/tmp/build-in-termux.sh"
+            "$TERMUX_DOCKER_IMAGE" bash /data/data/com.termux/files/usr/tmp/build-python-deb.sh)
+          docker cp "$SCRIPT" "$CID:/data/data/com.termux/files/usr/tmp/build-python-deb.sh"
           docker start --attach "$CID"
           STATUS=$(docker inspect --format='{{.State.ExitCode}}' "$CID")
           docker cp "$CID:/data/data/com.termux/files/home/output/." "$OUT_DIR/" 2>/dev/null || true
