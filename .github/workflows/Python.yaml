@@ -72,15 +72,15 @@ jobs:
           pkg upgrade -y
 
           echo "==> Snapshotting installed packages before"
-          dpkg-query -W -f='${Package}\n' | sort > /tmp/before_packages.txt
+          dpkg-query -W -f='${Package}\n' | sort > "$HOME/before_packages.txt"
 
           echo "==> Installing python and python-pip"
           pkg install -y python python-pip $EXTRA_PACKAGES
 
           echo "==> Snapshotting installed packages after"
-          dpkg-query -W -f='${Package}\n' | sort > /tmp/after_packages.txt
+          dpkg-query -W -f='${Package}\n' | sort > "$HOME/after_packages.txt"
 
-          NEW_PACKAGES="$(comm -13 /tmp/before_packages.txt /tmp/after_packages.txt)"
+          NEW_PACKAGES="$(comm -13 "$HOME/before_packages.txt" "$HOME/after_packages.txt")"
           if [ -z "$NEW_PACKAGES" ]; then
             echo "No new packages were installed - nothing to package." >&2
             exit 1
@@ -96,15 +96,10 @@ jobs:
           while IFS= read -r pkg; do
             [ -z "$pkg" ] && continue
             echo "  - $pkg"
-            dpkg-query -L "$pkg" > "/tmp/files_${pkg}.txt"
-            # Copy all files/dirs/symlinks preserving structure from root to stage
-            tar -C / -cf - --files-from="/tmp/files_${pkg}.txt" | tar -C "$STAGE" -xf -
+            dpkg-query -L "$pkg" > "$HOME/files_${pkg}.txt"
+            tar -C / -cf - --files-from="$HOME/files_${pkg}.txt" | tar -C "$STAGE" -xf -
           done <<< "$NEW_PACKAGES"
 
-          # Remove any possible /data/data/com.termux prefix duplication (shouldn't happen)
-          # The stage contains the prefix path already, we need only the content under /data/data/com.termux/files/usr etc.
-
-          # Get Python version for package version
           PY_VERSION="$(python3 --version | awk '{print $2}')"
           echo "Python version detected: ${PY_VERSION}"
 
