@@ -71,56 +71,46 @@ jobs:
           pkg update -y
           pkg upgrade -y
 
-          echo "==> Snapshotting installed packages before"
-          dpkg-query -W -f='${Package}\n' | sort > "$HOME/before_packages.txt"
-
-          echo "==> Installing python and python-pip"
+          echo "==> Installing python and python-pip (and extras) for dependency metadata"
           pkg install -y python python-pip $EXTRA_PACKAGES
 
-          echo "==> Snapshotting installed packages after"
-          dpkg-query -W -f='${Package}\n' | sort > "$HOME/after_packages.txt"
+          echo "==> Collecting package metadata"
+          PKG_VERSION="$(python3 --version | awk '{print $2}')"
 
-          NEW_PACKAGES="$(comm -13 "$HOME/before_packages.txt" "$HOME/after_packages.txt")"
-          if [ -z "$NEW_PACKAGES" ]; then
-            echo "No new packages were installed - nothing to package." >&2
-            exit 1
-          fi
-          echo "Packages to bundle:"
-          echo "$NEW_PACKAGES"
+          # Get dependencies of python and python-pip from dpkg
+          DEPS=$(apt-cache depends python python-pip $EXTRA_PACKAGES 2>/dev/null | grep 'Depends:' | sed 's/.*Depends:\s*//' | tr '\n' ',' | sed 's/,$//' || true)
+          # Add python and python-pip themselves to Depends? We will include their files, so no need to depend on themselves.
+          # Actually we only want dependencies that are not bundled. We'll leave Depends field as these dependencies.
+          # Remove duplicates
+          DEPS=$(echo "$DEPS" | tr ',' '\n' | sort -u | grep -v '^python$' | grep -v '^python-pip$' | paste -sd, -)
 
           STAGE="$HOME/python-pkgroot"
           rm -rf "$STAGE"
           mkdir -p "$STAGE/DEBIAN"
 
-          echo "==> Copying files from new packages"
-          while IFS= read -r pkg; do
-            [ -z "$pkg" ] && continue
+          echo "==> Copying files from python and python-pip packages"
+          for pkg in python python-pip $EXTRA_PACKAGES; do
             echo "  - $pkg"
-            # Get list of files, keep only those inside Termux prefix
             dpkg-query -L "$pkg" | grep '^/data/data/com.termux/files/usr/' > "$HOME/files_${pkg}.txt" || true
             if [ -s "$HOME/files_${pkg}.txt" ]; then
               tar -C / -cf - --files-from="$HOME/files_${pkg}.txt" | tar -C "$STAGE" -xf -
             fi
-          done <<< "$NEW_PACKAGES"
+          done
 
-          PY_VERSION="$(python3 --version | awk '{print $2}')"
-          echo "Python version detected: ${PY_VERSION}"
-
-          DEB_NAME="python-termux_${PY_VERSION}_${TERMUX_PKG_ARCH}.deb"
+          DEB_NAME="python-termux_${PKG_VERSION}_${TERMUX_PKG_ARCH}.deb"
           SIZE_KB="$(du -sk "$STAGE" | cut -f1)"
 
           cat > "$STAGE/DEBIAN/control" << CONTROL_EOF
           Package: python-termux
-          Version: ${PY_VERSION}
+          Version: ${PKG_VERSION}
           Architecture: ${TERMUX_PKG_ARCH}
           Maintainer: ${MAINTAINER}
           Installed-Size: ${SIZE_KB}
-          Depends: 
+          Depends: ${DEPS}
           Homepage: https://www.python.org
           Description: Python interpreter and pip bundled for Termux (armv7)
-           This package bundles python, python-pip, and their dependencies
-           as installed from the official Termux repositories.
-           Install with: dpkg -i python-termux_<version>_arm.deb
+           This package contains the files of python, python-pip, and any extra packages,
+           but relies on system-installed dependencies.
           CONTROL_EOF
 
           mkdir -p "$HOME/output"
