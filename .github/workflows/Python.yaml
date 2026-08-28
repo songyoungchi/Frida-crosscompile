@@ -123,8 +123,8 @@ jobs:
 
           mkdir -p "$HOME/output"
 
-          echo "==> Building package with strong compression (zstd -19 --ultra)"
-          dpkg-deb --root-owner-group -Zzstd -z19 -Sextreme --build "$STAGE" "$HOME/output/${DEB_NAME}"
+          echo "==> Building package with strong compression (zstd -19)"
+          dpkg-deb --root-owner-group -Zzstd -z19 --build "$STAGE" "$HOME/output/${DEB_NAME}"
 
           echo "==> Built package:"
           ls -lh "$HOME/output"
