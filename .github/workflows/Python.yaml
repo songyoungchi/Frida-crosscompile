@@ -1,13 +1,7 @@
-name: Build Python .deb for Termux (armv7)
+name: Build Python+Pip offline .deb for Termux (armv7)
 
 on:
   workflow_dispatch:
-    inputs:
-      extra_packages:
-        description: "Optional space-separated list of additional Termux packages to bundle (e.g. python-numpy)"
-        required: false
-        type: string
-        default: ""
   push:
     tags:
       - "v*.*.*"
@@ -23,9 +17,9 @@ env:
 
 jobs:
   build:
-    name: Build Python bundle (Termux arm)
+    name: Build Python+Pip bundle (Termux arm)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: write
 
@@ -38,9 +32,8 @@ jobs:
       - name: Pull Termux arm build image
         run: docker pull --platform "$TERMUX_DOCKER_PLATFORM" "$TERMUX_DOCKER_IMAGE"
 
-      - name: Build Python .deb inside Termux
+      - name: Build Python+Pip .deb inside Termux
         env:
-          EXTRA_PACKAGES: ${{ github.event.inputs.extra_packages }}
           MAINTAINER: ${{ github.repository_owner }} <${{ github.repository_owner }}@users.noreply.github.com>
         run: |
           set -euo pipefail
@@ -51,12 +44,11 @@ jobs:
           {
             printf '#!/data/data/com.termux/files/usr/bin/bash\n'
             printf 'set -euo pipefail\n'
-            printf 'EXTRA_PACKAGES=%q\n' "$EXTRA_PACKAGES"
             printf 'TERMUX_PKG_ARCH=%q\n' "$TERMUX_PKG_ARCH"
             printf 'MAINTAINER=%q\n' "$MAINTAINER"
             cat <<'BUILD_SCRIPT_EOF'
 
-          echo "==> Building Python bundle for Termux (android-${TERMUX_PKG_ARCH})"
+          echo "==> Building Python+Pip offline package for Termux (android-${TERMUX_PKG_ARCH})"
 
           export HOME=/data/data/com.termux/files/home
           export PREFIX=/data/data/com.termux/files/usr
@@ -69,52 +61,70 @@ jobs:
 
           echo "==> Updating Termux package lists"
           pkg update -y
-          pkg upgrade -y
 
-          echo "==> Installing python and python-pip (and extras) for dependency metadata"
-          pkg install -y python python-pip $EXTRA_PACKAGES
+          echo "==> Snapshotting installed packages before"
+          dpkg-query -W -f='${Package}\t${Version}\n' | sort > "$HOME/before_packages.txt"
 
-          echo "==> Collecting package metadata"
-          PKG_VERSION="$(python3 --version | awk '{print $2}')"
+          echo "==> Installing python (this also installs python-pip and all dependencies)"
+          pkg install -y python
 
-          # Get dependencies of python and python-pip from dpkg
-          DEPS=$(apt-cache depends python python-pip $EXTRA_PACKAGES 2>/dev/null | grep 'Depends:' | sed 's/.*Depends:\s*//' | tr '\n' ',' | sed 's/,$//' || true)
-          # Add python and python-pip themselves to Depends? We will include their files, so no need to depend on themselves.
-          # Actually we only want dependencies that are not bundled. We'll leave Depends field as these dependencies.
-          # Remove duplicates
-          DEPS=$(echo "$DEPS" | tr ',' '\n' | sort -u | grep -v '^python$' | grep -v '^python-pip$' | paste -sd, -)
+          echo "==> Snapshotting installed packages after"
+          dpkg-query -W -f='${Package}\t${Version}\n' | sort > "$HOME/after_packages.txt"
+
+          echo "==> Determining which packages changed or were installed"
+          awk 'NR==FNR{a[$1]=$2; next} !($1 in a) || a[$1]!=$2 {print $1}' \
+            "$HOME/before_packages.txt" "$HOME/after_packages.txt" > "$HOME/changed_packages.txt"
+
+          if [ ! -s "$HOME/changed_packages.txt" ]; then
+            echo "No packages changed - nothing to package." >&2
+            exit 1
+          fi
+
+          echo "Changed/new packages:"
+          cat "$HOME/changed_packages.txt"
 
           STAGE="$HOME/python-pkgroot"
           rm -rf "$STAGE"
           mkdir -p "$STAGE/DEBIAN"
 
-          echo "==> Copying files from python and python-pip packages"
-          for pkg in python python-pip $EXTRA_PACKAGES; do
+          echo "==> Copying files from changed packages"
+          while IFS= read -r pkg; do
+            [ -z "$pkg" ] && continue
             echo "  - $pkg"
             dpkg-query -L "$pkg" | grep '^/data/data/com.termux/files/usr/' > "$HOME/files_${pkg}.txt" || true
             if [ -s "$HOME/files_${pkg}.txt" ]; then
               tar -C / -cf - --files-from="$HOME/files_${pkg}.txt" | tar -C "$STAGE" -xf -
             fi
-          done
+          done < "$HOME/changed_packages.txt"
 
-          DEB_NAME="python-termux_${PKG_VERSION}_${TERMUX_PKG_ARCH}.deb"
+          PY_VERSION="$(dpkg-query -W -f='${Version}' python)"
+          echo "Python version: ${PY_VERSION}"
+
+          DEB_NAME="python_${PY_VERSION}_${TERMUX_PKG_ARCH}.deb"
           SIZE_KB="$(du -sk "$STAGE" | cut -f1)"
 
           cat > "$STAGE/DEBIAN/control" << CONTROL_EOF
-          Package: python-termux
-          Version: ${PKG_VERSION}
+          Package: python
+          Version: ${PY_VERSION}
           Architecture: ${TERMUX_PKG_ARCH}
           Maintainer: ${MAINTAINER}
           Installed-Size: ${SIZE_KB}
-          Depends: ${DEPS}
+          Depends: 
+          Provides: python, python-pip
           Homepage: https://www.python.org
-          Description: Python interpreter and pip bundled for Termux (armv7)
-           This package contains the files of python, python-pip, and any extra packages,
-           but relies on system-installed dependencies.
+          Description: Python interpreter and pip for Termux (armv7) - offline bundle
+           This package contains all files that would be installed by 'pkg install python'
+           plus all its dependencies, including python-pip, clang, libllvm, etc.
+           Install with: dpkg -i --force-overwrite python_<version>_arm.deb
           CONTROL_EOF
 
+          chmod 755 "$STAGE"
+          chmod 755 "$STAGE/DEBIAN"
+
           mkdir -p "$HOME/output"
-          dpkg-deb --root-owner-group --build "$STAGE" "$HOME/output/${DEB_NAME}"
+
+          echo "==> Building package with strong compression (zstd -19 --ultra)"
+          dpkg-deb --root-owner-group -Zzstd -z19 -Sextreme --build "$STAGE" "$HOME/output/${DEB_NAME}"
 
           echo "==> Built package:"
           ls -lh "$HOME/output"
@@ -148,7 +158,7 @@ jobs:
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v5
         with:
-          name: python-termux-arm
+          name: python-termux-arm-offline
           path: dist/*.deb
           if-no-files-found: error
 
